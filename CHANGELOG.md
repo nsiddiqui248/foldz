@@ -1,10 +1,25 @@
 # Changelog
 
-Changes per foldz version. The version and the file format share one number: foldz 0.12 writes and reads format 12. Until 1.0, a `.foldz` file only decompresses with the version that made it.
+Changes per foldz version. The version and the file format share one number: foldz 0.13 writes and reads format 13. Until 1.0, a `.foldz` file only decompresses with the version that made it.
 
 Each section below becomes the release notes when its tag (for example `v0.12`) is pushed; see `.github/workflows/release.yml`.
 
 ## [Unreleased]
+
+## [0.13] - 2026-11-12
+
+File format 13.
+
+### Changed
+- Q8_0 values are coded as two 4-bit symbols (high nibble, then low nibble given the high one) from static seed tables, like the K-quants, instead of 8 bit-by-bit steps.
+- Compression schedules better: pass 1 only counts the types with static tables, and everything else (metadata, floats) is coded in pass 2 alongside them. Same output, less idle time.
+
+### Results
+- Qwen3-0.6B-Q8_0: 565.4 → 563.9 MiB (Q8_0 6.56% → 6.84% saved), Q8_0 work halved (131 → 61 thread-seconds), round trip 17.8 → 11.2 s.
+- Qwen3.5-2B (Q4_K_M, no Q8_0): same size (1109.8 MiB), round trip 33.4 → 25.3 s from the scheduling change.
+
+### Investigated, not adopted
+- The fold (Gray code) on every part of Q4_K_M and Q8_0 tensors, also per 4-bit group: no measurable effect, because both the bit trees and the symbol tables learn any relabelling of the values equally well.
 
 ## [0.12] - 2026-11-12
 

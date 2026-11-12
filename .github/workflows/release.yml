@@ -1,0 +1,51 @@
+# On every pushed tag vX.Y (or vX.Y.Z): check that foldz.c has that version, build it,
+# run a round trip, and publish a GitHub Release whose notes are that version's
+# section of CHANGELOG.md. The release fails if the section is missing.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write          # needed to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version in foldz.c must match the tag
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          grep -q "#define FOLDZ_VERSION \"$ver\"" foldz.c || {
+            echo "::error::tag $GITHUB_REF_NAME but foldz.c says: $(grep '#define FOLDZ_VERSION' foldz.c)"; exit 1; }
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section '## [$ver]'"; exit 1
+          fi
+          cat notes.md
+
+      - name: Build and round trip
+        run: |
+          gcc -O2 -Wall -pthread -ffp-contract=off -o foldz foldz.c -lm
+          ./foldz v
+          ./foldz t foldz.c            # byte-model round trip; exits non-zero if it differs
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" foldz.c \
+            --title "foldz ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md \
+            --prerelease

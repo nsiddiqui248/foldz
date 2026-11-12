@@ -2,21 +2,31 @@
 
 **Lossless compressor for GGUF models.** foldz shrinks quantized GGUF files (Q4_K_M and similar) by 7–13%, and decompression gives back the identical file, byte for byte. General-purpose compressors (zip, xz, zstd) gain very little on these files, because quantized weights look almost random to them.
 
-foldz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models learned from the data itself, using an adaptive range coder: quantized values are coded as whole symbols, one coder step per value. Everything else (metadata, other tensor types, padding) is coded with a byte-level context-mixing model. Nothing depends on the model's name or architecture.
+foldz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models fitted to the data itself, using a range coder. Quantized values are coded as whole symbols from static tables: the compressor counts the whole file first and stores one shared seed table per type, and each segment stores only how its tables differ from the seed. Decompression therefore learns nothing and is faster than compression. Everything else (metadata, other tensor types, padding) is coded with a byte-level context-mixing model. Nothing depends on the model's name or architecture.
 
-> Status: **0.11, pre-release** (file format 11; files from older versions need the version that made them). The file format may change before 1.0; a `.foldz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)).
+> Status: **0.12, pre-release** (file format 12; files from older versions need the version that made them). The file format may change before 1.0; a `.foldz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
 ## Results
 
-Nine public Q4_K_M models, tested with `foldz t` (compress and decompress in memory, then compare). Every round trip was byte-identical. Measured on an Android phone in Termux, with 8 threads, using 0.9. The current version gives the same or smaller sizes in about half the time:
+Nine public Q4_K_M models, tested with `foldz t` (compress and decompress in memory, then compare). Every round trip was byte-identical. Measured on an Android phone in Termux, with 8 threads, using 0.9. The current version gives smaller files:
 
-| Model | 0.9 MiB | 0.11 MiB | 0.11 `-H` MiB | 0.9 round trip | 0.11 round trip | 0.11 `-H` round trip |
-|---|---|---|---|---|---|---|
-| Qwen3.5-2B | 1111.3 | 1111.2 | 1111.5 | 58 s | 29 s | 26 s |
-| Qwen3-4B | 2073.3 | **2070.6** | 2071.5 | 138 s | 51 s | 50 s |
-| Qwen2.5-7B-Instruct | 4113.8 | 4113.3 * | | 220 s | 108 s * | |
+| Model | 0.9 MiB | 0.12 MiB | Saved with 0.12 | 0.9 round trip | 0.12 round trip |
+|---|---|---|---|---|---|
+| Qwen3.5-2B | 1111.3 | **1109.8** | 8.43% | 58 s | 35 s |
+| Qwen3-4B | 2073.3 | **2070.0** | 13.08% | 138 s | 47 s |
+| Qwen2.5-7B-Instruct | 4113.8 | **4111.0** | 7.95% | 220 s | 81 s |
 
-\* measured with 0.10. It has no AWQ lattice segments, where 0.11 differs, so 0.11 should give the same size.
+With `-H`, Qwen2.5-7B-Instruct came out 0.5 MiB larger (4111.5 MiB) with 19% less work (66 s round trip).
+
+Speed on Qwen3.5-2B, same phone (it slows down as it heats up, so treat these as ±20%):
+
+| Version | Compress | Decompress |
+|---|---|---|
+| 0.9 | 58 s for compress and decompress together | |
+| 0.11 | 12.0 s | 17.9 s |
+| 0.12 | 22.8 s | **15.1 s** |
+
+0.12 trades slower compression (an extra counting pass) for faster decompression and smaller files: compress once, decompress many times.
 
 Results with 0.9:
 
@@ -39,7 +49,7 @@ By tensor type, across the same models:
 |---|---|---|
 | Q4_K | 6.9–8.5% | the bulk of every Q4_K_M file |
 | Q5_K | 6.8% | one model |
-| Q6_K | 6.3–8.8% | **23.2%** on Qwen3-4B (23.6% with 0.11), where the AWQ lattice model was chosen for 36 of 43 segments |
+| Q6_K | 6.3–8.8% | **23.2%** on Qwen3-4B (23.6% with 0.12), where the AWQ lattice model was chosen for 36 of 43 segments |
 | BF16 | 33.9% | one model |
 | F32 | 63–81% | norms and biases, small |
 | metadata | about 81% | tokenizer, tensor index |
@@ -54,7 +64,7 @@ Qwen3.5-2B (Q4_K_M, 1211.9 MiB), on the same phone (8 cores):
 |---|---|---|---|
 | `zstd -19 --long=27 -T0` | 1186.9 | 25.0 MiB (2.07%) | 3 min 58 s, compress only (24.6 CPU-minutes) |
 | `xz -9 -T0` | 1190.4 | 21.6 MiB (1.78%) | 22 min 0 s, compress only (stayed on one thread) |
-| foldz 0.10 | 1111.2 | **100.7 MiB (8.31%)** | 32 s, compress and decompress |
+| foldz 0.12 | 1109.8 | **102.1 MiB (8.43%)** | 23 s compress, 15 s decompress |
 
 Quantized weights are close to incompressible for general-purpose compressors; most of what they save is probably the metadata. foldz saves about four times as much here. In fairness: foldz only works this well on GGUF, while zstd and xz work on any file, and zstd decompresses far faster. `xz -9 -T0` stayed on one thread, most likely because multithreaded level 9 would need more memory than xz allows itself by default. Baselines for other models are welcome.
 
@@ -62,8 +72,8 @@ Quantized weights are close to incompressible for general-purpose compressors; m
 
 | Tensor type | Model |
 |---|---|
-| Q4_K, Q5_K | Values are coded as whole symbols from adaptive counts. Contexts: the block's zero point, extremes seen (0 and max), position. Headers (d, dmin, scales, mins) are coded with their own contexts. |
-| Q6_K | Values as whole symbols. Context: the column's running offset and width (mean and spread in units of the sub-block's step), position, extremes seen. Or, if smaller, the AWQ lattice model for models converted from 4-bit AWQ/GPTQ checkpoints (lattice steps and errors coded as symbols). |
+| Q4_K, Q5_K | Values as whole symbols from static tables (seed per file, differences per segment). Contexts: the block's zero point, extremes seen (0 and max), position. Headers (d, dmin, scales, mins) are coded adaptively with their own contexts. |
+| Q6_K | Values as whole symbols from static tables. Context: the column's running offset and width (mean and spread in units of the sub-block's step), position, extremes seen. Or, if smaller, the AWQ lattice model for models converted from 4-bit AWQ/GPTQ checkpoints (lattice steps and errors coded as symbols). |
 | Q8_0 | Context: the column's sign bias, extremes seen, average magnitude so far in the block. |
 | F32, F16, BF16 | Sign, exponent (context: previous exponent), mantissa (top bits given the exponent). |
 | Everything else | Byte-level context mixing: orders 0–6, a match model, and a small logistic mixer. |
@@ -105,7 +115,7 @@ Options can go anywhere on the line:
 | `-t N` | threads (default: all cores) |
 | `-s MiB` | segment size (default 48); lower uses less memory |
 | `-m MiB` | memory limit for foldz, instead of the automatic one |
-| `-H` | code block headers (scales, mins, d) as symbols: faster to decompress, about 0.05% larger. Recorded in the file, so `foldz d` needs no option |
+| `-H` | code block headers (scales, mins, d) as symbols: about 20% less work on Qwen2.5-7B for 0.01% more size (up to 0.05% on other models). Recorded in the file, so `foldz d` needs no option |
 | `-f` | overwrite an existing output file |
 
 foldz never overwrites a file unless `-f` is given, and never writes over its own input.
@@ -150,7 +160,7 @@ The conclusion from all experiments: gains come from parsing the format and mode
 ## Limitations
 
 - **Supported tensor types:** Q4_K, Q5_K, Q6_K, Q8_0, F32, F16 and BF16. Other types (IQ quants, Q2_K, Q3_K, Q4_0...) are coded with the byte model, which gains little on them.
-- **Speed:** about 35–40 MiB/s round trip (compress plus decompress) on a phone with 8 threads, and 3–11% faster with `-H` on the two models measured (ARM; little difference on x86). Context modelling is symmetric, so decompression is about as slow as compression: each value waits for the one before it. The metadata segment is coded on one thread; it runs alongside the weights, but on machines with many cores it can become the longest part.
+- **Speed:** on a phone with 8 threads, about 50 MiB/s to compress and 80 MiB/s to decompress. Within a segment each value still waits for the one before it, so foldz is far slower than zstd to decompress. `-H` cuts the work by up to about 20% (measured on ARM; less on x86). The metadata segment is coded on one thread: on Qwen3.5-2B it now takes most of the decompression time, and on machines with many cores it can be the longest part of any run.
 - **Format:** pre-1.0, so it may change between versions.
 
 ## Help wanted
@@ -159,7 +169,7 @@ The conclusion from all experiments: gains come from parsing the format and mode
 2. **Baselines.** Report `zstd -19 --long` and `xz -9` sizes (and times) on other models, or on any GGUF.
 3. **More models and quant types,** especially Q5_K_M, Q6_K and Q8_0 files.
 4. **Fuzzing.** Run AFL++ or libFuzzer with AddressSanitizer on `foldz d`.
-5. **Ablations.** Measure how much each context contributes on real tensors.
+5. **Ablations.** Measure how much each context contributes on real tensors. Measured so far: column statistics for Q4_K (as Q6_K uses) would gain only about 0.2 points on Q4_K values, about 0.1% of the file, and cost speed, so foldz does not use them.
 
 When reporting results, include the full `foldz t` output, the model's Hugging Face name, and your CPU and OS.
 

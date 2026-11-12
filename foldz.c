@@ -1,8 +1,8 @@
 /*
- * foldz 0.11 - lossless compressor for GGUF models (file format 11)
+ * foldz 0.12 - lossless compressor for GGUF models (file format 12)
  *
- * The version and the file format share one number: foldz 0.11 writes and reads format 11
- * (magic "FOLDZ11"). Until 1.0 the format may change between versions; a file is only
+ * The version and the file format share one number: foldz 0.12 writes and reads format 12
+ * (magic "FOLDZ12"). Until 1.0 the format may change between versions; a file is only
  * guaranteed to decompress with the version that made it. Check with: foldz v
  *
  * Works on any GGUF file: tensors of the supported types are coded with
@@ -26,9 +26,13 @@
  * Safety: every segment whose coded size would not be smaller is stored raw,
  * so the output is never larger than the input (apart from a small index).
  *
- * Coder: adaptive range coder (LZMA style). Quantized values are coded as whole
- * symbols from adaptive counts, one coder step per value; everything else bit by
- * bit, probabilities updated like the KT estimator. With -H the block headers of
+ * Coder: range coder (LZMA style). Q4_K, Q5_K and Q6_K values are coded as whole
+ * symbols from static tables: the compressor first counts every segment, builds one
+ * seed table per type for the whole file, and each segment then stores, per context,
+ * either "use the seed" or its own table as differences from the seed. Decoding needs
+ * no learning, so it is faster than compression. Everything else is adaptive: AWQ
+ * lattice values as symbols, the rest bit by bit (probabilities updated like the KT
+ * estimator). With -H the block headers of
  * Q4_K, Q5_K and Q6_K are also coded as symbols: faster, about 0.05% larger. Big tensors are split into segments that are coded
  * independently, in parallel. Contexts use only exact or IEEE-754 arithmetic
  * (no libm functions except exact ones), so files decode identically on any
@@ -84,8 +88,8 @@
 #include <sys/sysctl.h>
 #endif
 
-#define FOLDZ_VERSION "0.11"
-static const char MAGIC[8] = {'F','O','L','D','Z','1','1','\n'};    /* file format 11 */
+#define FOLDZ_VERSION "0.12"
+static const char MAGIC[8] = {'F','O','L','D','Z','1','2','\n'};    /* file format 12 */
 enum { T_F32 = 0, T_F16 = 1, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_BF16 = 30, T_BYTES = 0xFFFF };
 enum { M_NORMAL = 0, M_LATTICE = 1, M_RAW = 255 };
 /* flag in the mode field: block headers coded as symbols (-H). Faster to decode, slightly larger. */
@@ -138,6 +142,8 @@ typedef struct {
     uint64_t low; uint32_t range; uint8_t cache; uint64_t csize;
     uint8_t *buf; size_t pos, cap;            /* encoder: bytes past cap are counted, not stored */
     uint32_t code; const uint8_t *in, *end;
+    const int16_t *stt;                       /* static value tables (cumulative, sum 2^12), or NULL */
+    uint32_t *cnt; int cnt_only;              /* encoder: count values per context (pass 1) */
 } Coder;
 
 /* The output buffer is allocated once at the segment's size. Output that reaches that size is
@@ -260,6 +266,30 @@ HOT int csym(Coder *c, const int dec, int16_t *U, const int n, int sym) {
     return sym;
 }
 
+/* a value from a static table: U holds cumulative frequencies summing to SM = 2^12, so the coder
+   needs no division by a total and no update. Zero-frequency symbols are never chosen. */
+#define SM_BITS 12
+#define SM (1 << SM_BITS)
+HOT int ssym(Coder *c, const int dec, const int16_t *U, const int n, int sym) {
+    uint32_t r = c->range >> SM_BITS;
+    if (dec) {
+        uint32_t v = c->code / r; if (v > SM - 1) v = SM - 1;      /* clamp: corrupt input stays in range */
+#ifdef SYM_VEC
+        V8 vv = IOTA8 * 0 + (int16_t)v, acc = IOTA8 * 0;
+        for (int k = 0; k < n; k += 8) { V8 u; memcpy(&u, U + k, 16); acc -= (V8)(u <= vv); }
+        uint64_t a[2]; memcpy(a, &acc, 16);
+        sym = (int)(((a[0] + a[1]) * 0x0001000100010001ull) >> 48);
+#else
+        sym = 0; for (int i = 0; i < n; i++) sym += U[i] <= (int16_t)v;
+#endif
+    }
+    uint32_t lo = sym ? (uint32_t)U[sym - 1] : 0, f = (uint32_t)U[sym] - lo;
+    if (dec) c->code -= r * lo; else c->low += r * lo;
+    c->range = r * f;
+    norm(c, dec);
+    return sym;
+}
+
 /* values wider than 6 bits as two symbol steps, the low part given the high part.
    th has 2^(nb-4) counts per context, tl 16 per (context, high part). */
 HOT int csym_split(Coder *c, const int dec, int16_t *th, int16_t *tl, const int nb, size_t ctx, int v) {
@@ -351,22 +381,25 @@ static void k_pack_vals(uint8_t *B, int bits, const uint8_t *q) {
     }
 }
 
-HOT void kq_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t nblocks, const int bits, const int sh) {
+/* ss: values from static tables; cn: encoder pass 1, count values only (nothing is coded) */
+HOT void kq_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t nblocks, const int bits, const int sh, const int ss, const int cn) {
     int bs = bits == 4 ? 144 : 176, maxv = (1 << bits) - 1, zmax = bits == 4 ? 31 : 63;
     size_t nctx = (size_t)(zmax + 1) * 36;
     Bit *dhi = NULL, *dlo = NULL, *mhi = NULL, *mlo = NULL, *msc = NULL, *mmn = NULL;
     F16S fd = {0}, fm = {0}; int16_t *ssc = NULL, *smn = NULL;
-    if (sh) { fd = f16s_new(); fm = f16s_new(); ssc = sym_new(64, 64); smn = sym_new(4096, 64); }
+    if (cn) {}
+    else if (sh) { fd = f16s_new(); fm = f16s_new(); ssc = sym_new(64, 64); smn = sym_new(4096, 64); }
     else { dhi = bits_new(65536); dlo = bits_new(65536); mhi = bits_new(65536); mlo = bits_new(65536);
            msc = bits_new(64 * 64); mmn = bits_new(4096 * 64); }
-    int16_t *sv = sym_new(nctx, 1 << bits);
+    int16_t *sv = ss || cn ? NULL : sym_new(nctx, 1 << bits);
     int pd = 0, pm = 0, psc = 0, pmn = 0;
     for (uint64_t b = 0; b < nblocks; b++) {
         uint8_t *B = data + b * bs;
         int sc[8], mn[8], zb[8]; uint8_t q[256];
         if (!dec) { k_unpack_scales(B + 4, sc, mn); k_unpack_vals(B, bits, q); }
         uint16_t d, dm;
-        if (sh) {
+        if (cn) { d = rd16(B); dm = rd16(B + 2); }
+        else if (sh) {
             d  = code_f16s(c, dec, &fd, &pd, dec ? 0 : rd16(B));
             dm = code_f16s(c, dec, &fm, &pm, dec ? 0 : rd16(B + 2));
             for (int j = 0; j < 8; j++) {
@@ -392,7 +425,9 @@ HOT void kq_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t nblocks, 
             for (int i = 0; i < 32; i++) {
                 int idx = s * 32 + i;
                 size_t ctx = (size_t)(zb[s] * 9 + (n0 < 2 ? n0 : 2) * 3 + (nm < 2 ? nm : 2)) * 4 + (i >> 3);
-                int n = csym(c, dec, sv + (ctx << bits), 1 << bits, q[idx]);
+                if (!dec && c->cnt) c->cnt[(ctx << bits) + q[idx]]++;
+                int n = cn ? q[idx] : ss ? ssym(c, dec, c->stt + (ctx << bits), 1 << bits, q[idx])
+                                         : csym(c, dec, sv + (ctx << bits), 1 << bits, q[idx]);
                 q[idx] = (uint8_t)n; n0 += n == 0; nm += n == maxv;
             }
         }
@@ -403,13 +438,15 @@ HOT void kq_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t nblocks, 
     free(dhi); free(dlo); free(mhi); free(mlo); free(msc); free(mmn); sym_free(sv);
     if (sh) { f16s_free(&fd); f16s_free(&fm); sym_free(ssc); sym_free(smn); }
 }
-/* bits and sh are constants in each copy, so the symbol loops have a fixed length */
-#define KQ(D, NB) (sh ? kq_code_impl(c, D, data, nblocks, NB, 1) : kq_code_impl(c, D, data, nblocks, NB, 0))
+/* every setting is a constant in its own copy, so the symbol loops have a fixed length */
+#define KQ2(D, NB, SS, CN) (sh ? kq_code_impl(c, D, data, nblocks, NB, 1, SS, CN) : kq_code_impl(c, D, data, nblocks, NB, 0, SS, CN))
+#define KQ1(D, NB) do { if (!(D) && c->cnt_only) KQ2(0, NB, 0, 1); else if (c->stt) KQ2(D, NB, 1, 0); else KQ2(D, NB, 0, 0); } while (0)
 static void kq_code(Coder *c, uint8_t *data, uint64_t nblocks, int bits, int sh) {
-    if (c->dec) { if (bits == 4) KQ(1, 4); else KQ(1, 5); }
-    else        { if (bits == 4) KQ(0, 4); else KQ(0, 5); }
+    if (c->dec) { if (bits == 4) KQ1(1, 4); else KQ1(1, 5); }
+    else        { if (bits == 4) KQ1(0, 4); else KQ1(0, 5); }
 }
-#undef KQ
+#undef KQ1
+#undef KQ2
 
 /* ---------------- Q6_K ---------------- */
 /* block: ql(128) qh(64) scales(16, int8) d(2); 16 sub-blocks of 16 */
@@ -477,11 +514,12 @@ static inline int width_bucket(double r2) {
     return clampi((mant >= 0.70710678118654752 ? e : e - 1) - 2, 0, 7);
 }
 #define Q6_CTX 9600                    /* 25 offset x 8 width x 16 pos x 3 extremes */
-HOT void q6k_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t rows, uint64_t ne0, const int lat, const int sh) {
+HOT void q6k_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t rows, uint64_t ne0, const int lat, const int sh, const int ss, const int cn) {
     Bit *dhi = NULL, *dlo = NULL, *msc = NULL; F16S fd = {0}; int16_t *sch = NULL, *scl = NULL;
-    if (sh) { fd = f16s_new(); sch = sym_new(256, 16); scl = sym_new(256 * 16, 16); }
+    if (cn) {}
+    else if (sh) { fd = f16s_new(); sch = sym_new(256, 16); scl = sym_new(256 * 16, 16); }
     else { dhi = bits_new(65536); dlo = bits_new(65536); msc = bits_new(65536); }
-    int16_t *sv = lat ? NULL : sym_new(Q6_CTX, 64);
+    int16_t *sv = lat || ss || cn ? NULL : sym_new(Q6_CTX, 64);
     int16_t *skm = NULL, *sex = NULL, *skh = NULL, *skl = NULL, *se = NULL;
     if (lat) { skm = sym_new(33, 64); sex = sym_new(9, 64); skh = sym_new(66, 8); skl = sym_new(66 * 8, 16); se = sym_new(33, 8); }
     double *SW = lat ? NULL : calloc(ne0, sizeof *SW), *SW2 = lat ? NULL : calloc(ne0, sizeof *SW2);
@@ -491,9 +529,10 @@ HOT void q6k_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t rows, ui
         for (uint64_t bb = 0; bb < bpr; bb++) {
             uint8_t *B = data + (r * bpr + bb) * 210;
             uint8_t q[256]; int scs[16];
-            uint16_t d = sh ? code_f16s(c, dec, &fd, &pd, dec ? 0 : rd16(B + 208))
-                            : code_f16(c, dec, dhi, dlo, &pd, dec ? 0 : rd16(B + 208));
-            for (int k = 0; k < 16; k++) {
+            uint16_t d = cn ? rd16(B + 208) : sh ? code_f16s(c, dec, &fd, &pd, dec ? 0 : rd16(B + 208))
+                                                 : code_f16(c, dec, dhi, dlo, &pd, dec ? 0 : rd16(B + 208));
+            if (cn) for (int k = 0; k < 16; k++) scs[k] = (int)(int8_t)B[192 + k] + 128;
+            else for (int k = 0; k < 16; k++) {
                 int sym = dec ? 0 : (int)(int8_t)B[192 + k] + 128;
                 sym = sh ? csym_split(c, dec, sch, scl, 8, (size_t)psc, sym) : ctree(c, dec, msc + psc * 256, 8, sym);
                 psc = sym; scs[k] = sym;
@@ -537,7 +576,9 @@ HOT void q6k_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t rows, ui
                         widb = isfinite(r2) && r2 > 0 ? width_bucket(r2) : 0;
                     }
                     int ctx = (offb * 8 + widb) * 48 + pos * 3 + (nx < 2 ? nx : 2);
-                    int v = csym(c, dec, sv + (size_t)ctx * 64, 64, q[i]);
+                    if (!dec && c->cnt) c->cnt[(size_t)ctx * 64 + q[i]]++;
+                    int v = cn ? q[i] : ss ? ssym(c, dec, c->stt + (size_t)ctx * 64, 64, q[i])
+                                           : csym(c, dec, sv + (size_t)ctx * 64, 64, q[i]);
                     q[i] = (uint8_t)v; nx += v <= 1;
                     double W = (v - 32) * Ds;
                     if (isfinite(W)) { SW[col] += W; SW2[col] += W * W; }
@@ -555,10 +596,12 @@ HOT void q6k_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t rows, ui
     sym_free(skm); sym_free(sex); sym_free(skh); sym_free(skl); sym_free(se);
 }
 static void q6k_code(Coder *c, uint8_t *data, uint64_t rows, uint64_t ne0, int lat, int sh) {
-    #define Q6(D) do { if (lat) { if (sh) q6k_code_impl(c, D, data, rows, ne0, 1, 1); else q6k_code_impl(c, D, data, rows, ne0, 1, 0); } \
-                       else     { if (sh) q6k_code_impl(c, D, data, rows, ne0, 0, 1); else q6k_code_impl(c, D, data, rows, ne0, 0, 0); } } while (0)
+    #define Q6S(D, L, SS, CN) (sh ? q6k_code_impl(c, D, data, rows, ne0, L, 1, SS, CN) : q6k_code_impl(c, D, data, rows, ne0, L, 0, SS, CN))
+    #define Q6(D) do { if (lat) Q6S(D, 1, 0, 0); else if (!(D) && c->cnt_only) Q6S(0, 0, 0, 1); \
+                       else if (c->stt) Q6S(D, 0, 1, 0); else Q6S(D, 0, 0, 0); } while (0)
     if (c->dec) Q6(1); else Q6(0);
     #undef Q6
+    #undef Q6S
 }
 
 /* ---------------- Q8_0 ---------------- */
@@ -744,6 +787,127 @@ static void code_seg(Coder *c, Seg *s, uint8_t *p) {
     }
 }
 
+/* ---------------- static value tables ---------------- */
+/* K-quant types with static value tables: index, symbols per context, contexts */
+static int kq_index(uint32_t type) { return type == T_Q4K ? 0 : type == T_Q5K ? 1 : type == T_Q6K ? 2 : -1; }
+static const int KQ_SYM[3] = {16, 32, 64}, KQ_CTX[3] = {32 * 36, 64 * 36, Q6_CTX};
+/* segments coded with static tables: K-quants, not the lattice, not raw */
+static int is_static(const Seg *s) { return kq_index(s->type) >= 0 && (s->model & 255) == M_NORMAL; }
+
+/* frequencies summing to SM; every seen symbol gets at least 1, unseen ones 0 */
+static void quantize(const uint64_t *n, int k, uint16_t *f) {
+    uint64_t N = 0; for (int i = 0; i < k; i++) N += n[i];
+    for (int i = 0; i < k; i++) f[i] = 0;
+    if (!N) return;
+    int sum = 0;
+    for (int i = 0; i < k; i++) if (n[i]) {
+        uint64_t q = (n[i] * (uint64_t)SM + N / 2) / N; f[i] = (uint16_t)(q ? q : 1); sum += f[i];
+    }
+    while (sum != SM) {                                  /* fix the total on the largest entries */
+        int b = -1;
+        for (int i = 0; i < k; i++) if (n[i] && (sum < SM || f[i] > 1) && (b < 0 || f[i] > f[b])) b = i;
+        if (sum < SM) { f[b]++; sum++; } else { f[b]--; sum--; }
+    }
+}
+static void cum_row(const uint16_t *f, int k, int16_t *U) { int a = 0; for (int i = 0; i < k; i++) { a += f[i]; U[i] = (int16_t)a; } }
+static void uniform_row(int k, uint16_t *f) { for (int i = 0; i < k; i++) f[i] = (uint16_t)(SM / k); }
+
+/* one seed per K-quant type: the counts of all its static segments together */
+typedef struct {
+    int k, nctx;
+    uint64_t *agg;          /* pass 1: summed counts (compressor only) */
+    uint16_t *f;            /* frequencies per context; a row of zeros = context unused */
+    uint8_t *used;
+} Seed;
+static void seed_alloc(Seed *sd, int t) {
+    sd->k = KQ_SYM[t]; sd->nctx = KQ_CTX[t];
+    sd->f = calloc((size_t)sd->nctx * sd->k, 2); sd->used = calloc(sd->nctx, 1);
+    if (!sd->f || !sd->used) die("out of memory");
+}
+static void seed_free(Seed *sd) { free(sd->agg); free(sd->f); free(sd->used); memset(sd, 0, sizeof *sd); }
+
+/* small integers 0..SM: zero flag, then Elias gamma with adaptive bits per position i */
+typedef struct { Bit *z, *e; } IntM;
+static IntM intm_new(int k) { IntM m = { bits_new((size_t)k * 2), bits_new((size_t)k * 14) }; return m; }
+static void intm_free(IntM *m) { free(m->z); free(m->e); }
+static int code_mag(Coder *c, int dec, IntM *m, int i, int v) {    /* v in 1..SM */
+    int e = 0;
+    if (!dec) while ((v >> (e + 1)) != 0) e++;
+    int ee = 0;
+    while (ee < 13 && cbit(c, dec, &m->e[i * 14 + ee], ee < e)) ee++;
+    e = ee;
+    int r = dec ? 1 : v;
+    if (dec) { for (int b = e - 1; b >= 0; b--) r = (r << 1) | cdirect(c, dec, 0); }
+    else for (int b = e - 1; b >= 0; b--) cdirect(c, dec, (v >> b) & 1);
+    return r;
+}
+static int code_uint(Coder *c, int dec, IntM *m, int i, int v) {   /* v in 0..SM */
+    if (!cbit(c, dec, &m->z[i * 2], v != 0)) return 0;
+    return code_mag(c, dec, m, i, v);
+}
+static int code_sint(Coder *c, int dec, IntM *m, int i, int v) {   /* v in -SM..SM */
+    if (!cbit(c, dec, &m->z[i * 2], v != 0)) return 0;
+    int neg = cbit(c, dec, &m->z[i * 2 + 1], v < 0);
+    int a = code_mag(c, dec, m, i, v < 0 ? -v : v);
+    return neg ? -a : a;
+}
+/* the seed tables of all types, coded once per file */
+static void code_seeds(Coder *c, int dec, Seed sd[3]) {
+    Bit pres[3]; bits_init(pres, 3);
+    for (int t = 0; t < 3; t++) {
+        int has = cbit(c, dec, &pres[t], sd[t].f != NULL);
+        if (!has) continue;
+        if (dec) seed_alloc(&sd[t], t);
+        int k = sd[t].k; IntM m = intm_new(k); Bit um[2]; bits_init(um, 2); int pu = 0;
+        for (int x = 0; x < sd[t].nctx; x++) {
+            int u = cbit(c, dec, &um[pu], sd[t].used[x]); pu = u; sd[t].used[x] = (uint8_t)u;
+            uint16_t *f = sd[t].f + (size_t)x * k;
+            if (!u) continue;
+            int sum = 0;
+            for (int i = 0; i < k; i++) { int v = code_uint(c, dec, &m, i, f[i]); if (v > SM) die("corrupt file"); f[i] = (uint16_t)v; sum += v; }
+            if (sum != SM) die("corrupt file");
+        }
+        intm_free(&m);
+    }
+}
+/* one segment's tables, at the start of its stream: per context the seed has, "unused",
+   "use the seed" or "own frequencies as differences from the seed". Fills the cumulative
+   tables U for coding (unused contexts: the seed; contexts the seed lacks: uniform). */
+static void code_tables(Coder *c, int dec, const Seed *sd, const uint16_t *own, const uint32_t *ownN, int16_t *U) {
+    int k = sd->k; IntM m = intm_new(k); Bit um[2], om[2]; bits_init(um, 2); bits_init(om, 2);
+    int pu = 0, po = 0; uint16_t f[64];
+    for (int x = 0; x < sd->nctx; x++) {
+        const uint16_t *fs = sd->f + (size_t)x * k;
+        if (!sd->used[x]) { uniform_row(k, f); cum_row(f, k, U + (size_t)x * k); continue; }
+        int u = cbit(c, dec, &um[pu], !dec && ownN[x] > 0); pu = u;
+        int useown = 0;
+        if (u) {
+            if (!dec) {                                  /* estimated cost of each choice, in bits */
+                const uint16_t *fo = own + (size_t)x * k; double es = 0, eo = 0;
+                for (int i = 0; i < k; i++) {
+                    double nn = (double)fo[i] * ownN[x] / SM;
+                    if (fo[i]) { if (!fs[i]) es = 1e300; else es += nn * log2((double)SM / fs[i]); eo += nn * log2((double)SM / fo[i]); }
+                    int d = (int)fo[i] - (int)fs[i], a = d < 0 ? -d : d, e = 0; while ((a >> (e + 1)) != 0) e++;
+                    eo += d ? 2.0 * e + 3 : 0.3;
+                }
+                useown = eo < es;
+            }
+            useown = cbit(c, dec, &om[po], useown); po = useown;
+        }
+        if (useown) {
+            int sum = 0;
+            for (int i = 0; i < k; i++) {
+                int v = (int)fs[i] + code_sint(c, dec, &m, i, dec ? 0 : (int)own[(size_t)x * k + i] - (int)fs[i]);
+                if (v < 0 || v > SM) die("corrupt file");
+                f[i] = (uint16_t)v; sum += v;
+            }
+            if (sum != SM) die("corrupt file");
+        } else memcpy(f, fs, (size_t)k * 2);
+        cum_row(f, k, U + (size_t)x * k);
+    }
+    intm_free(&m);
+}
+
 /* ---------------- GGUF parsing ---------------- */
 typedef struct { const uint8_t *p; size_t n, pos; } Rd;
 static void need(Rd *r, size_t k) { if (k > r->n || r->pos > r->n - k) die("truncated or invalid GGUF"); }
@@ -835,6 +999,7 @@ static Seg *find_segments(const uint8_t *p, size_t n, uint64_t seg_target, int *
               | nseg x (u64 off, u64 ne0, u64 rows, u32 type | model << 16, u64 clen, u64 coff)
               | raw bytes between segments | coded segments at their coff */
 #define ENTRY 44
+#define HDR 36                                   /* magic, size, segments, seed offset, seed length */
 typedef struct {
     int mode;                          /* 0 compress, 1 decompress, 2 test */
     Seg *seg; int n; int next, failed, done; int *order;
@@ -846,6 +1011,10 @@ typedef struct {
        device still has that much plus the reserve free; one segment can always run */
     uint64_t *need, used, peak, budget, reserve; int live, inflight, max_inflight; char *taken;
     int hsym;                                      /* -H: block headers as symbols */
+    int phase;                                     /* compress: 1 = count (and finish all others), 2 = static K-quants */
+    char *skip; int ntodo;                         /* segments this run leaves alone */
+    Seed seed[3], dseed[3];                        /* seed tables: built (compress), decoded (test, decompress) */
+    uint16_t **ownf; uint32_t **ownN; uint64_t *held;   /* per segment, from pass 1 to pass 2 */
     pthread_cond_t cv;
 } Job;
 
@@ -926,19 +1095,23 @@ static uint64_t model_bytes(const Seg *s) {
 }
 /* peak memory of one segment: tables plus buffers. Compress: the coded output (Q6_K may code
    twice and keep the smaller). Test: output plus the decoded copy. Decompress: the decoded copy. */
-static uint64_t seg_need(const Seg *s, int mode) {
-    uint64_t z = s->size, slack = 1u << 20;
-    if (mode == 1) return s->model == M_RAW ? slack : slack + model_bytes(s) + z;
-    if (mode == 0) return slack + model_bytes(s) + (s->type == T_Q6K ? 2 : 1) * z;
-    return slack + model_bytes(s) + 2 * z;
+static uint64_t seg_need(const Seg *s, int mode, int phase) {
+    uint64_t z = s->size, slack = 1u << 20, mb = model_bytes(s);
+    int t = kq_index(s->type);
+    uint64_t tab = t >= 0 ? (uint64_t)KQ_CTX[t] * KQ_SYM[t] * 2 : 0;          /* one table set, int16 */
+    if (mode == 1) return (s->model & 255) == M_RAW ? slack : slack + mb + z + (is_static(s) ? tab : 0);
+    if (t < 0) return slack + mb + (mode == 2 ? 2 : 1) * z;
+    if (phase == 1) return slack + mb + 2 * tab + (s->type == T_Q6K ? 2 * z : 0);   /* counts; Q6_K may try the lattice */
+    return slack + mb + tab + (mode == 2 ? 2 * (z + tab) : z);
 }
+static uint64_t held_bytes(const Seg *s) { int t = kq_index(s->type); return (uint64_t)KQ_CTX[t] * (KQ_SYM[t] * 2 + 4); }
 #define MiB(x) ((double)(x) / 1048576.0)
 /* Fix the memory budget from what the device has free now, keeping a reserve for the system
    and other apps: 15% of RAM, at least 512 MiB, at most 2 GiB. limit (-m) replaces all this. */
 static int plan_memory(Job *j, int threads, uint64_t limit) {
     j->need = xmalloc((j->n + 1) * sizeof *j->need); j->taken = calloc(j->n + 1, 1);
     if (!j->taken) die("out of memory");
-    uint64_t mx = 0; for (int i = 0; i < j->n; i++) { j->need[i] = seg_need(&j->seg[i], j->mode); if (j->need[i] > mx) mx = j->need[i]; }
+    uint64_t mx = 0; for (int i = 0; i < j->n; i++) { j->need[i] = seg_need(&j->seg[i], j->mode, j->phase); if (j->need[i] > mx) mx = j->need[i]; }
     const uint64_t base = 32u << 20;                     /* foldz itself: index, tables, stacks */
     if (threads > j->n && j->n > 0) threads = j->n;
     if (threads < 1) threads = 1;
@@ -970,12 +1143,12 @@ static int plan_memory(Job *j, int threads, uint64_t limit) {
 static int claim(Job *j) {
     pthread_mutex_lock(&j->mu);
     for (;;) {
-        uint64_t avail = j->live && j->used ? mem_avail() : 0;
+        uint64_t avail = j->live && j->inflight ? mem_avail() : 0;
         int left = 0;
         for (int qi = 0; qi < j->n; qi++) {
             if (j->taken[qi]) continue;
             left = 1; int i = j->order[qi]; uint64_t need = j->need[i];
-            int fits = j->used == 0 ||                                   /* never stall: one always runs */
+            int fits = j->inflight == 0 ||                               /* never stall: one always runs */
                        (j->used + need <= j->budget && (!avail || avail >= need + j->reserve));
             if (!fits) continue;
             j->taken[qi] = 1; j->used += need; j->inflight++;
@@ -988,42 +1161,92 @@ static int claim(Job *j) {
         pthread_cond_wait(&j->cv, &j->mu);              /* woken when a running segment finishes */
     }
 }
+/* a coded segment: store raw if not smaller, then write it (compress) or check it (test) */
+static void finish_coded(Job *j, int i, Seg *s, Coder *c, const uint8_t *src) {
+    const uint8_t *outp = c->buf;
+    if (c->pos >= s->size) { c->pos = s->size; outp = src; s->model = M_RAW; }   /* never larger: store raw */
+    j->clen[i] = c->pos;
+    if (j->mode == 0) {
+        pthread_mutex_lock(&j->mu); uint64_t at = j->end; j->end += c->pos; pthread_mutex_unlock(&j->mu);
+        pwrite_all(j->fd, outp, c->pos, at); j->coff[i] = at;
+    } else if (s->model != M_RAW) {
+        uint8_t *buf = xmalloc(s->size); int16_t *U = NULL;
+        Coder d; dec_init(&d, c->buf, c->pos);
+        if (is_static(s)) { int t = kq_index(s->type); U = xmalloc((size_t)KQ_CTX[t] * KQ_SYM[t] * 2);
+                            code_tables(&d, 1, &j->dseed[t], NULL, NULL, U); d.stt = U; }
+        code_seg(&d, s, buf);
+        if (memcmp(buf, src, s->size)) __atomic_store_n(&j->failed, 1, __ATOMIC_RELAXED);
+        free(buf); free(U);
+    }
+    free(c->buf); c->buf = NULL;
+}
 static void *worker(void *arg) {
     Job *j = arg;
     for (;;) {
         int i = claim(j);
         if (i < 0) break;
         Seg *s = &j->seg[i]; Coder c; double ts = now();
+        int t = kq_index(s->type);
         if (j->mode != 1) {
             const uint8_t *src = j->in + s->off;
-            uint32_t xf = j->hsym && (s->type == T_Q4K || s->type == T_Q5K || s->type == T_Q6K) ? H_SYM : 0;
-            s->model = M_NORMAL | xf;
-            enc_init(&c, s->size); code_seg(&c, s, (uint8_t *)src); enc_flush(&c);
-            if (s->type == T_Q6K && lattice_sample(src, s->size / 210) < 20) {
-                Coder c2; s->model = M_LATTICE | xf;
-                enc_init(&c2, s->size); code_seg(&c2, s, (uint8_t *)src); enc_flush(&c2);
-                if (c2.pos < c.pos) { free(c.buf); c = c2; } else { free(c2.buf); s->model = M_NORMAL | xf; }
+            uint32_t xf = j->hsym && t >= 0 ? H_SYM : 0;
+            if (j->phase == 2) {                             /* static tables, then the values */
+                size_t tn = (size_t)KQ_CTX[t] * KQ_SYM[t];
+                int16_t *U = xmalloc(tn * 2);
+                enc_init(&c, s->size); code_tables(&c, 0, &j->seed[t], j->ownf[i], j->ownN[i], U);
+                c.stt = U; code_seg(&c, s, (uint8_t *)src); enc_flush(&c); c.stt = NULL;
+                free(j->ownf[i]); free(j->ownN[i]); j->ownf[i] = NULL; j->ownN[i] = NULL;
+                pthread_mutex_lock(&j->mu); j->used -= j->held[i]; pthread_mutex_unlock(&j->mu);
+                free(U);
+                finish_coded(j, i, s, &c, src);
+            } else if (t >= 0) {                             /* pass 1: count (Q6_K may pick the lattice now) */
+                size_t tn = (size_t)KQ_CTX[t] * KQ_SYM[t];
+                uint32_t *cnt = calloc(tn, 4); if (!cnt) die("out of memory");
+                int lattice = 0;
+                s->model = M_NORMAL | xf;
+                if (s->type == T_Q6K && lattice_sample(src, s->size / 210) < 20) {
+                    enc_init(&c, s->size); c.cnt = cnt; code_seg(&c, s, (uint8_t *)src); enc_flush(&c); c.cnt = NULL;
+                    Coder c2; s->model = M_LATTICE | xf;
+                    enc_init(&c2, s->size); code_seg(&c2, s, (uint8_t *)src); enc_flush(&c2);
+                    if (c2.pos < c.pos) { free(c.buf); c = c2; lattice = 1; }
+                    else { free(c2.buf); free(c.buf); s->model = M_NORMAL | xf; }
+                } else {
+                    Coder cc; memset(&cc, 0, sizeof cc); cc.cnt = cnt; cc.cnt_only = 1;
+                    code_seg(&cc, s, (uint8_t *)src);
+                }
+                if (lattice) { free(cnt); finish_coded(j, i, s, &c, src); }
+                else {
+                    int k = KQ_SYM[t], nx = KQ_CTX[t];
+                    uint16_t *f = xmalloc(tn * 2); uint32_t *N = xmalloc((size_t)nx * 4); uint64_t row[64];
+                    for (int x = 0; x < nx; x++) { uint64_t sum = 0;
+                        for (int q = 0; q < k; q++) { row[q] = cnt[(size_t)x * k + q]; sum += row[q]; }
+                        N[x] = (uint32_t)sum; quantize(row, k, f + (size_t)x * k); }
+                    pthread_mutex_lock(&j->mu);
+                    if (!j->seed[t].agg) { j->seed[t].agg = calloc(tn, 8); if (!j->seed[t].agg) die("out of memory"); }
+                    for (size_t q = 0; q < tn; q++) j->seed[t].agg[q] += cnt[q];
+                    j->ownf[i] = f; j->ownN[i] = N; j->held[i] = held_bytes(s);
+                    j->used += j->held[i]; if (j->used > j->peak) j->peak = j->used;
+                    pthread_mutex_unlock(&j->mu);
+                    free(cnt);
+                }
+            } else {
+                s->model = M_NORMAL;
+                enc_init(&c, s->size); code_seg(&c, s, (uint8_t *)src); enc_flush(&c);
+                finish_coded(j, i, s, &c, src);
             }
-            const uint8_t *outp = c.buf;
-            if (c.pos >= s->size) { c.pos = s->size; outp = src; s->model = M_RAW; }   /* never larger: store raw */
-            j->clen[i] = c.pos;
-            if (j->mode == 0) {
-                pthread_mutex_lock(&j->mu); uint64_t at = j->end; j->end += c.pos; pthread_mutex_unlock(&j->mu);
-                pwrite_all(j->fd, outp, c.pos, at); j->coff[i] = at;
-            } else if (s->model != M_RAW) {
-                uint8_t *buf = xmalloc(s->size);
-                Coder d; dec_init(&d, c.buf, c.pos); code_seg(&d, s, buf);
-                if (memcmp(buf, src, s->size)) __atomic_store_n(&j->failed, 1, __ATOMIC_RELAXED);
-                free(buf);
-            }
-            free(c.buf);
         } else if (s->model == M_RAW) {                      /* straight from the input, no buffer */
             if (j->clen[i] != s->size) die("corrupt file");
             pwrite_all(j->fd, j->in + j->coff[i], s->size, s->off);
         } else {
-            uint8_t *buf = xmalloc(s->size);
-            dec_init(&c, j->in + j->coff[i], j->clen[i]); code_seg(&c, s, buf);
-            pwrite_all(j->fd, buf, s->size, s->off); free(buf);
+            uint8_t *buf = xmalloc(s->size); int16_t *U = NULL;
+            dec_init(&c, j->in + j->coff[i], j->clen[i]);
+            if (is_static(s)) {
+                if (!j->dseed[t].f) die("corrupt file");
+                U = xmalloc((size_t)KQ_CTX[t] * KQ_SYM[t] * 2);
+                code_tables(&c, 1, &j->dseed[t], NULL, NULL, U); c.stt = U;
+            }
+            code_seg(&c, s, buf);
+            pwrite_all(j->fd, buf, s->size, s->off); free(buf); free(U);
         }
         double dt = now() - ts;
         pthread_mutex_lock(&j->mu);
@@ -1032,7 +1255,8 @@ static void *worker(void *arg) {
         if (dt > j->tmax) { j->tmax = dt; j->tmax_seg = i; }
         pthread_mutex_unlock(&j->mu);
         int d = __atomic_add_fetch(&j->done, 1, __ATOMIC_RELAXED);
-        fprintf(stderr, "\r  %d/%d segments, %.0f s", d, j->n, now() - j->t0);
+        fprintf(stderr, "\r  %s%d/%d segments, %.0f s", j->phase == 1 ? "pass 1: " : j->phase == 2 ? "pass 2: " : "",
+                d, j->ntodo, now() - j->t0);
     }
     return NULL;
 }
@@ -1046,12 +1270,15 @@ static void run(Job *j, int threads) {
     j->order = xmalloc((j->n + 1) * sizeof(int));
     for (int i = 0; i < j->n; i++) j->order[i] = i;
     SORT_SEGS = j->seg; qsort(j->order, j->n, sizeof(int), cmp_cost);
+    j->ntodo = 0;
+    for (int qi = 0; qi < j->n; qi++) { j->taken[qi] = j->skip && j->skip[j->order[qi]]; j->ntodo += !j->taken[qi]; }
     j->next = 0; j->done = 0; j->t0 = now(); pthread_mutex_init(&j->mu, NULL); pthread_cond_init(&j->cv, NULL);
     pthread_t th[256]; if (threads > 256) threads = 256; if (threads < 1) threads = 1;
     if (threads > j->n && j->n > 0) threads = j->n;
     for (int i = 0; i < threads; i++) pthread_create(&th[i], NULL, worker, j);
     for (int i = 0; i < threads; i++) pthread_join(th[i], NULL);
-    fprintf(stderr, "\n"); free(j->order); free(j->need); free(j->taken);
+    if (j->ntodo) fprintf(stderr, "\n");
+    free(j->order);
 }
 static void time_report(Job *j, double wall, int threads) {
     double tot = 0; for (int k = 0; k < NTYPES; k++) tot += j->tsum[k];
@@ -1092,12 +1319,15 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
     int ns; Seg *s = find_segments(p, n, segb, &ns);
     printf("%s: %.1f MiB, %d segments to code\n", in, n / 1048576.0, ns);
     Job j; memset(&j, 0, sizeof j);
-    j.mode = test ? 2 : 0; j.seg = s; j.n = ns; j.in = p; j.fd = -1; j.hsym = hsym;
+    j.mode = test ? 2 : 0; j.seg = s; j.n = ns; j.in = p; j.fd = -1; j.hsym = hsym; j.phase = 1;
     if (hsym) printf("-H: block headers as symbols (faster to decompress, slightly larger)\n");
     threads = plan_memory(&j, threads, limit);
     j.clen = calloc(ns + 1, 8); j.coff = calloc(ns + 1, 8);
+    j.ownf = calloc(ns + 1, sizeof *j.ownf); j.ownN = calloc(ns + 1, sizeof *j.ownN); j.held = calloc(ns + 1, 8);
+    j.skip = calloc(ns + 1, 1);
+    if (!j.clen || !j.coff || !j.ownf || !j.ownN || !j.held || !j.skip) die("out of memory");
     uint64_t seg_total = 0; for (int i = 0; i < ns; i++) seg_total += s[i].size;
-    uint64_t hdr = 20 + (uint64_t)ns * ENTRY;
+    uint64_t hdr = HDR + (uint64_t)ns * ENTRY;
     if (!test) {
         j.fd = open(out, O_RDWR | O_CREAT | O_TRUNC, 0644); if (j.fd < 0) die("cannot create output");
         uint64_t at = 0, w = hdr;
@@ -1108,8 +1338,40 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
         }
         j.end = w;
     }
-    double t0 = now(); run(&j, threads); double t1 = now();
-    uint64_t ctotal = 0; for (int i = 0; i < ns; i++) ctotal += j.clen[i];
+    double t0 = now(); run(&j, threads);                 /* pass 1: counts; everything else finished */
+    /* seeds: one table set per K-quant type, from the counts of all its static segments */
+    size_t seed_cap = 4096;
+    for (int t = 0; t < 3; t++) if (j.seed[t].agg) {
+        uint64_t *agg = j.seed[t].agg; seed_alloc(&j.seed[t], t); j.seed[t].agg = agg;
+        int k = j.seed[t].k;
+        for (int x = 0; x < j.seed[t].nctx; x++) {
+            uint64_t sum = 0; for (int q = 0; q < k; q++) sum += agg[(size_t)x * k + q];
+            j.seed[t].used[x] = sum > 0;
+            quantize(agg + (size_t)x * k, k, j.seed[t].f + (size_t)x * k);
+        }
+        free(agg); j.seed[t].agg = NULL;
+        seed_cap += (size_t)j.seed[t].nctx * k * 4;
+    }
+    Coder sc; enc_init(&sc, seed_cap); code_seeds(&sc, 0, j.seed); enc_flush(&sc);
+    if (sc.pos > sc.cap) die("internal: seed buffer too small");
+    uint64_t seed_off = 0, seed_len = sc.pos;
+    if (!test) { seed_off = j.end; pwrite_all(j.fd, sc.buf, sc.pos, seed_off); j.end += sc.pos; }
+    else {                                               /* check the seeds' own round trip */
+        Coder d; dec_init(&d, sc.buf, sc.pos); code_seeds(&d, 1, j.dseed);
+        for (int t = 0; t < 3; t++) {
+            if (!j.seed[t].f != !j.dseed[t].f) j.failed = 1;
+            else if (j.seed[t].f && (memcmp(j.seed[t].f, j.dseed[t].f, (size_t)j.seed[t].nctx * j.seed[t].k * 2) ||
+                                     memcmp(j.seed[t].used, j.dseed[t].used, j.seed[t].nctx))) j.failed = 1;
+        }
+    }
+    free(sc.buf);
+    /* pass 2: static K-quant segments */
+    j.phase = 2;
+    for (int i = 0; i < ns; i++) { j.skip[i] = j.ownf[i] == NULL; j.need[i] = seg_need(&s[i], j.mode, 2); }
+    run(&j, threads);
+    double t1 = now();
+    for (int t = 0; t < 3; t++) { seed_free(&j.seed[t]); seed_free(&j.dseed[t]); }
+    uint64_t ctotal = seed_len; for (int i = 0; i < ns; i++) ctotal += j.clen[i];
     uint64_t out_total = hdr + (n - seg_total) + ctotal;
     if (test) printf("compressed and decompressed in %.1f s\n", t1 - t0);
     else printf("compressed in %.1f s (%.1f MiB/s)\n", t1 - t0, n / 1048576.0 / (t1 - t0));
@@ -1121,9 +1383,9 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
         return;
     }
     uint8_t *h = calloc(1, hdr); uint64_t v = n; uint32_t c32 = (uint32_t)ns;
-    memcpy(h, MAGIC, 8); memcpy(h + 8, &v, 8); memcpy(h + 16, &c32, 4);
+    memcpy(h, MAGIC, 8); memcpy(h + 8, &v, 8); memcpy(h + 16, &c32, 4); memcpy(h + 20, &seed_off, 8); memcpy(h + 28, &seed_len, 8);
     for (int i = 0; i < ns; i++) {
-        uint8_t *e = h + 20 + (uint64_t)i * ENTRY; uint32_t tm = s[i].type | (s[i].model << 16);
+        uint8_t *e = h + HDR + (uint64_t)i * ENTRY; uint32_t tm = s[i].type | (s[i].model << 16);
         memcpy(e, &s[i].off, 8); memcpy(e + 8, &s[i].ne0, 8); memcpy(e + 16, &s[i].rows, 8);
         memcpy(e + 24, &tm, 4); memcpy(e + 28, &j.clen[i], 8); memcpy(e + 36, &j.coff[i], 8);
     }
@@ -1132,15 +1394,17 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
 
 static void cmd_decompress(const char *in, const char *out, int threads, uint64_t limit) {
     size_t n; const uint8_t *p = map_file(in, &n);
-    if (n < 20) die("not a foldz file");
+    if (n < HDR) die("not a foldz file");
     if (memcmp(p, MAGIC, 8)) {
         if (!memcmp(p, "FOLDZ", 5) && p[7] == '\n')
-            fprintf(stderr, "foldz: file format %.2s, but foldz " FOLDZ_VERSION " reads only format 11: "
+            fprintf(stderr, "foldz: file format %.2s, but foldz " FOLDZ_VERSION " reads only format 12: "
                             "use the foldz version that made it\n", (const char *)p + 5), exit(1);
         die("not a foldz file");
     }
     uint64_t orig; uint32_t ns; memcpy(&orig, p + 8, 8); memcpy(&ns, p + 16, 4);
-    uint64_t pos = 20; if ((uint64_t)ns * ENTRY > n - pos) die("corrupt header");
+    uint64_t seed_off, seed_len; memcpy(&seed_off, p + 20, 8); memcpy(&seed_len, p + 28, 8);
+    if (seed_off > n || seed_len > n - seed_off) die("corrupt header");
+    uint64_t pos = HDR; if ((uint64_t)ns * ENTRY > n - pos) die("corrupt header");
     Seg *s = calloc(ns + 1, sizeof *s); uint64_t *clen = calloc(ns + 1, 8), *coff = calloc(ns + 1, 8);
     for (uint32_t i = 0; i < ns; i++) {
         const uint8_t *e = p + pos; uint32_t tm;
@@ -1165,10 +1429,12 @@ static void cmd_decompress(const char *in, const char *out, int threads, uint64_
     }
     Job j; memset(&j, 0, sizeof j);
     j.mode = 1; j.seg = s; j.n = (int)ns; j.in = p; j.fd = fd; j.clen = clen; j.coff = coff;
+    { Coder d; dec_init(&d, p + seed_off, seed_len); code_seeds(&d, 1, j.dseed); }
     threads = plan_memory(&j, threads, limit);
     double t0 = now(); run(&j, threads); double t1 = now();
     if (ftruncate(fd, (off_t)orig)) die("cannot size output");
     close(fd);
+    for (int t = 0; t < 3; t++) seed_free(&j.dseed[t]);
     printf("decompressed %.1f MiB in %.1f s (%.1f MiB/s)\n", orig / 1048576.0, t1 - t0, orig / 1048576.0 / (t1 - t0));
     time_report(&j, t1 - t0, threads);
 }
@@ -1200,7 +1466,7 @@ static void check_output(const char *in, const char *out, int force) {
 int main(int argc, char **argv) {
     init_tables(); init_stretch();
     if (argc == 2 && (argv[1][0] == 'v' || !strcmp(argv[1], "--version"))) {
-        printf("foldz " FOLDZ_VERSION " (file format 11)\n"); return 0;
+        printf("foldz " FOLDZ_VERSION " (file format 12)\n"); return 0;
     }
     if (argc < 3) {
         fprintf(stderr, "usage: foldz c in [out.foldz] [-t threads] [-s segment_MiB] [-m MiB] [-H] [-f]\n"

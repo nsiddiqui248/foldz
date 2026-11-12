@@ -1,8 +1,8 @@
 /*
- * foldz 0.12 - lossless compressor for GGUF models (file format 12)
+ * foldz 0.13 - lossless compressor for GGUF models (file format 13)
  *
- * The version and the file format share one number: foldz 0.12 writes and reads format 12
- * (magic "FOLDZ12"). Until 1.0 the format may change between versions; a file is only
+ * The version and the file format share one number: foldz 0.13 writes and reads format 13
+ * (magic "FOLDZ13"). Until 1.0 the format may change between versions; a file is only
  * guaranteed to decompress with the version that made it. Check with: foldz v
  *
  * Works on any GGUF file: tensors of the supported types are coded with
@@ -27,7 +27,8 @@
  * so the output is never larger than the input (apart from a small index).
  *
  * Coder: range coder (LZMA style). Q4_K, Q5_K and Q6_K values are coded as whole
- * symbols from static tables: the compressor first counts every segment, builds one
+ * symbols, Q8_0 values as two 4-bit symbols (high, then low given high), all from
+ * static tables: the compressor first counts every segment, builds one
  * seed table per type for the whole file, and each segment then stores, per context,
  * either "use the seed" or its own table as differences from the seed. Decoding needs
  * no learning, so it is faster than compression. Everything else is adaptive: AWQ
@@ -88,8 +89,8 @@
 #include <sys/sysctl.h>
 #endif
 
-#define FOLDZ_VERSION "0.12"
-static const char MAGIC[8] = {'F','O','L','D','Z','1','2','\n'};    /* file format 12 */
+#define FOLDZ_VERSION "0.13"
+static const char MAGIC[8] = {'F','O','L','D','Z','1','3','\n'};    /* file format 13 */
 enum { T_F32 = 0, T_F16 = 1, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_BF16 = 30, T_BYTES = 0xFFFF };
 enum { M_NORMAL = 0, M_LATTICE = 1, M_RAW = 255 };
 /* flag in the mode field: block headers coded as symbols (-H). Faster to decode, slightly larger. */
@@ -607,21 +608,31 @@ static void q6k_code(Coder *c, uint8_t *data, uint64_t rows, uint64_t ne0, int l
 /* ---------------- Q8_0 ---------------- */
 /* block: d(2) + 32 int8; w = d * q; the quantizer maps the largest |w| to +-127 */
 #define Q8_CTX (8 * 3 * 16)
-HOT void q80_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t rows, uint64_t ne0) {
-    Bit *dhi = bits_new(65536), *dlo = bits_new(65536), *val = bits_new((size_t)Q8_CTX * 256);
+/* values as two 4-bit symbols from static tables: contexts 0..Q8_CTX-1 for the high nibble,
+   then Q8_CTX + ctx * 16 + high for the low nibble. ss: static tables; cn: count only (pass 1) */
+HOT void q80_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t rows, uint64_t ne0, const int ss, const int cn) {
+    Bit *dhi = cn ? NULL : bits_new(65536), *dlo = cn ? NULL : bits_new(65536), *val = ss || cn ? NULL : bits_new((size_t)Q8_CTX * 256);
     int64_t *P = calloc(ne0, sizeof *P); if (!P) die("out of memory");
     uint64_t bpr = ne0 / 32; int pd = 0;
     for (uint64_t r = 0; r < rows; r++) {
         for (uint64_t bb = 0; bb < bpr; bb++) {
             uint8_t *B = data + (r * bpr + bb) * 34;
-            uint16_t d = code_f16(c, dec, dhi, dlo, &pd, dec ? 0 : rd16(B));
+            uint16_t d = cn ? rd16(B) : code_f16(c, dec, dhi, dlo, &pd, dec ? 0 : rd16(B));
             int ds = sgn16(d), nx = 0, sa = 0;
             for (int i = 0; i < 32; i++) {
                 uint64_t col = bb * 32 + i;
                 int cb = share_bucket(P[col], (int64_t)r); if (ds < 0) cb = 7 - cb;
                 int avgb = i ? clampi((sa / i) >> 3, 0, 15) : 0;
                 int ctx = (cb * 3 + (nx < 2 ? nx : 2)) * 16 + avgb;
-                int v = ctree(c, dec, val + (size_t)ctx * 256, 8, dec ? 0 : (int)(int8_t)B[2 + i] + 128) - 128;
+                int u = dec ? 0 : (int)(int8_t)B[2 + i] + 128, v;
+                if (cn) {
+                    c->cnt[(size_t)ctx * 16 + (u >> 4)]++; c->cnt[((size_t)Q8_CTX + (size_t)ctx * 16 + (u >> 4)) * 16 + (u & 15)]++;
+                    v = u - 128;
+                } else if (ss) {
+                    int hi = ssym(c, dec, c->stt + (size_t)ctx * 16, 16, u >> 4);
+                    int lo = ssym(c, dec, c->stt + ((size_t)Q8_CTX + (size_t)ctx * 16 + hi) * 16, 16, u & 15);
+                    v = ((hi << 4) | lo) - 128;
+                } else v = ctree(c, dec, val + (size_t)ctx * 256, 8, u) - 128;
                 nx += v >= 127 || v <= -127; sa += v < 0 ? -v : v;
                 P[col] += (int64_t)v * ds > 0;
                 if (dec) B[2 + i] = (uint8_t)(int8_t)v;
@@ -631,7 +642,11 @@ HOT void q80_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t rows, ui
     }
     free(dhi); free(dlo); free(val); free(P);
 }
-MODEL(q80_code, uint8_t *data X uint64_t rows X uint64_t ne0, data X rows X ne0)
+static void q80_code(Coder *c, uint8_t *data, uint64_t rows, uint64_t ne0) {
+    if (c->dec) { if (c->stt) q80_code_impl(c, 1, data, rows, ne0, 1, 0); else q80_code_impl(c, 1, data, rows, ne0, 0, 0); }
+    else if (c->cnt_only) q80_code_impl(c, 0, data, rows, ne0, 0, 1);
+    else if (c->stt) q80_code_impl(c, 0, data, rows, ne0, 1, 0); else q80_code_impl(c, 0, data, rows, ne0, 0, 0);
+}
 
 /* ---------------- F32, F16, BF16 ---------------- */
 HOT void float_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t n, uint32_t type) {
@@ -788,9 +803,10 @@ static void code_seg(Coder *c, Seg *s, uint8_t *p) {
 }
 
 /* ---------------- static value tables ---------------- */
-/* K-quant types with static value tables: index, symbols per context, contexts */
-static int kq_index(uint32_t type) { return type == T_Q4K ? 0 : type == T_Q5K ? 1 : type == T_Q6K ? 2 : -1; }
-static const int KQ_SYM[3] = {16, 32, 64}, KQ_CTX[3] = {32 * 36, 64 * 36, Q6_CTX};
+/* types with static value tables (K-quants and Q8_0): index, symbols per context, contexts */
+#define NSTATIC 4
+static int kq_index(uint32_t type) { return type == T_Q4K ? 0 : type == T_Q5K ? 1 : type == T_Q6K ? 2 : type == T_Q8_0 ? 3 : -1; }
+static const int KQ_SYM[NSTATIC] = {16, 32, 64, 16}, KQ_CTX[NSTATIC] = {32 * 36, 64 * 36, Q6_CTX, Q8_CTX * 17};
 /* segments coded with static tables: K-quants, not the lattice, not raw */
 static int is_static(const Seg *s) { return kq_index(s->type) >= 0 && (s->model & 255) == M_NORMAL; }
 
@@ -852,9 +868,9 @@ static int code_sint(Coder *c, int dec, IntM *m, int i, int v) {   /* v in -SM..
     return neg ? -a : a;
 }
 /* the seed tables of all types, coded once per file */
-static void code_seeds(Coder *c, int dec, Seed sd[3]) {
-    Bit pres[3]; bits_init(pres, 3);
-    for (int t = 0; t < 3; t++) {
+static void code_seeds(Coder *c, int dec, Seed sd[NSTATIC]) {
+    Bit pres[NSTATIC]; bits_init(pres, NSTATIC);
+    for (int t = 0; t < NSTATIC; t++) {
         int has = cbit(c, dec, &pres[t], sd[t].f != NULL);
         if (!has) continue;
         if (dec) seed_alloc(&sd[t], t);
@@ -1011,9 +1027,9 @@ typedef struct {
        device still has that much plus the reserve free; one segment can always run */
     uint64_t *need, used, peak, budget, reserve; int live, inflight, max_inflight; char *taken;
     int hsym;                                      /* -H: block headers as symbols */
-    int phase;                                     /* compress: 1 = count (and finish all others), 2 = static K-quants */
+    int phase;                                     /* compress: 1 = count (Q6_K: also try the lattice), 2 = code everything else */
     char *skip; int ntodo;                         /* segments this run leaves alone */
-    Seed seed[3], dseed[3];                        /* seed tables: built (compress), decoded (test, decompress) */
+    Seed seed[NSTATIC], dseed[NSTATIC];                        /* seed tables: built (compress), decoded (test, decompress) */
     uint16_t **ownf; uint32_t **ownN; uint64_t *held;   /* per segment, from pass 1 to pass 2 */
     pthread_cond_t cv;
 } Job;
@@ -1087,7 +1103,7 @@ static uint64_t model_bytes(const Seg *s) {
         case T_Q4K: return B * (4 * 65536 + 64 * 64 + 4096 * 64) + 2 * ((uint64_t)32 * 36 << 4);
         case T_Q5K: return B * (4 * 65536 + 64 * 64 + 4096 * 64) + 2 * ((uint64_t)64 * 36 << 5);
         case T_Q6K: return B * (3 * 65536 + 33 * 64 + 9 * 64 + 66 * 128 + 33 * 8) + 2 * (uint64_t)Q6_CTX * 64 + 16 * s->ne0;
-        case T_Q8_0: return B * (2 * 65536 + (uint64_t)Q8_CTX * 256) + 8 * s->ne0;
+        case T_Q8_0: return B * (2 * 65536 + (uint64_t)Q8_CTX * 256) + 8 * s->ne0;   /* bit tree: upper bound */
         case T_BYTES: { int hb = bytes_hb(s->size);
                         return B * ((4ull << hb) + 256 + 65536 + 128) + (4ull << (hb - 2)) + 256 * 3 * NIN * 4; }
         default: return B * (4 + 3 * 64 * 256 + 512);
@@ -1189,8 +1205,8 @@ static void *worker(void *arg) {
         int t = kq_index(s->type);
         if (j->mode != 1) {
             const uint8_t *src = j->in + s->off;
-            uint32_t xf = j->hsym && t >= 0 ? H_SYM : 0;
-            if (j->phase == 2) {                             /* static tables, then the values */
+            uint32_t xf = j->hsym && t >= 0 && t < 3 ? H_SYM : 0;
+            if (j->phase == 2 && t >= 0) {                   /* static tables, then the values */
                 size_t tn = (size_t)KQ_CTX[t] * KQ_SYM[t];
                 int16_t *U = xmalloc(tn * 2);
                 enc_init(&c, s->size); code_tables(&c, 0, &j->seed[t], j->ownf[i], j->ownN[i], U);
@@ -1338,10 +1354,11 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
         }
         j.end = w;
     }
-    double t0 = now(); run(&j, threads);                 /* pass 1: counts; everything else finished */
+    for (int i = 0; i < ns; i++) j.skip[i] = kq_index(s[i].type) < 0;   /* metadata and floats wait for pass 2 */
+    double t0 = now(); run(&j, threads);                 /* pass 1: counts (and lattice segments, finished) */
     /* seeds: one table set per K-quant type, from the counts of all its static segments */
     size_t seed_cap = 4096;
-    for (int t = 0; t < 3; t++) if (j.seed[t].agg) {
+    for (int t = 0; t < NSTATIC; t++) if (j.seed[t].agg) {
         uint64_t *agg = j.seed[t].agg; seed_alloc(&j.seed[t], t); j.seed[t].agg = agg;
         int k = j.seed[t].k;
         for (int x = 0; x < j.seed[t].nctx; x++) {
@@ -1358,7 +1375,7 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
     if (!test) { seed_off = j.end; pwrite_all(j.fd, sc.buf, sc.pos, seed_off); j.end += sc.pos; }
     else {                                               /* check the seeds' own round trip */
         Coder d; dec_init(&d, sc.buf, sc.pos); code_seeds(&d, 1, j.dseed);
-        for (int t = 0; t < 3; t++) {
+        for (int t = 0; t < NSTATIC; t++) {
             if (!j.seed[t].f != !j.dseed[t].f) j.failed = 1;
             else if (j.seed[t].f && (memcmp(j.seed[t].f, j.dseed[t].f, (size_t)j.seed[t].nctx * j.seed[t].k * 2) ||
                                      memcmp(j.seed[t].used, j.dseed[t].used, j.seed[t].nctx))) j.failed = 1;
@@ -1367,10 +1384,10 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
     free(sc.buf);
     /* pass 2: static K-quant segments */
     j.phase = 2;
-    for (int i = 0; i < ns; i++) { j.skip[i] = j.ownf[i] == NULL; j.need[i] = seg_need(&s[i], j.mode, 2); }
+    for (int i = 0; i < ns; i++) { j.skip[i] = kq_index(s[i].type) >= 0 && j.ownf[i] == NULL; j.need[i] = seg_need(&s[i], j.mode, 2); }
     run(&j, threads);
     double t1 = now();
-    for (int t = 0; t < 3; t++) { seed_free(&j.seed[t]); seed_free(&j.dseed[t]); }
+    for (int t = 0; t < NSTATIC; t++) { seed_free(&j.seed[t]); seed_free(&j.dseed[t]); }
     uint64_t ctotal = seed_len; for (int i = 0; i < ns; i++) ctotal += j.clen[i];
     uint64_t out_total = hdr + (n - seg_total) + ctotal;
     if (test) printf("compressed and decompressed in %.1f s\n", t1 - t0);
@@ -1397,7 +1414,7 @@ static void cmd_decompress(const char *in, const char *out, int threads, uint64_
     if (n < HDR) die("not a foldz file");
     if (memcmp(p, MAGIC, 8)) {
         if (!memcmp(p, "FOLDZ", 5) && p[7] == '\n')
-            fprintf(stderr, "foldz: file format %.2s, but foldz " FOLDZ_VERSION " reads only format 12: "
+            fprintf(stderr, "foldz: file format %.2s, but foldz " FOLDZ_VERSION " reads only format 13: "
                             "use the foldz version that made it\n", (const char *)p + 5), exit(1);
         die("not a foldz file");
     }
@@ -1434,7 +1451,7 @@ static void cmd_decompress(const char *in, const char *out, int threads, uint64_
     double t0 = now(); run(&j, threads); double t1 = now();
     if (ftruncate(fd, (off_t)orig)) die("cannot size output");
     close(fd);
-    for (int t = 0; t < 3; t++) seed_free(&j.dseed[t]);
+    for (int t = 0; t < NSTATIC; t++) seed_free(&j.dseed[t]);
     printf("decompressed %.1f MiB in %.1f s (%.1f MiB/s)\n", orig / 1048576.0, t1 - t0, orig / 1048576.0 / (t1 - t0));
     time_report(&j, t1 - t0, threads);
 }
@@ -1466,7 +1483,7 @@ static void check_output(const char *in, const char *out, int force) {
 int main(int argc, char **argv) {
     init_tables(); init_stretch();
     if (argc == 2 && (argv[1][0] == 'v' || !strcmp(argv[1], "--version"))) {
-        printf("foldz " FOLDZ_VERSION " (file format 12)\n"); return 0;
+        printf("foldz " FOLDZ_VERSION " (file format 13)\n"); return 0;
     }
     if (argc < 3) {
         fprintf(stderr, "usage: foldz c in [out.foldz] [-t threads] [-s segment_MiB] [-m MiB] [-H] [-f]\n"

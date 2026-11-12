@@ -2,19 +2,27 @@
 
 **Lossless compressor for GGUF models.** foldz shrinks quantized GGUF files (Q4_K_M and similar) by 7–13%, and decompression gives back the identical file, byte for byte. General-purpose compressors (zip, xz, zstd) gain very little on these files, because quantized weights look almost random to them.
 
-foldz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models fitted to the data itself, using a range coder. Quantized values are coded as whole symbols from static tables: the compressor counts the whole file first and stores one shared seed table per type, and each segment stores only how its tables differ from the seed. Decompression therefore learns nothing and is faster than compression. Everything else (metadata, other tensor types, padding) is coded with a byte-level context-mixing model. Nothing depends on the model's name or architecture.
+foldz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models fitted to the data itself, using a range coder. Quantized values are coded as whole symbols (Q8_0 as two 4-bit symbols) from static tables: the compressor counts the whole file first and stores one shared seed table per type, and each segment stores only how its tables differ from the seed. Decompression therefore learns nothing and is faster than compression. Everything else (metadata, other tensor types, padding) is coded with a byte-level context-mixing model. Nothing depends on the model's name or architecture.
 
-> Status: **0.12, pre-release** (file format 12; files from older versions need the version that made them). The file format may change before 1.0; a `.foldz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
+> Status: **0.13, pre-release** (file format 13; files from older versions need the version that made them). The file format may change before 1.0; a `.foldz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
 ## Results
 
 Nine public Q4_K_M models, tested with `foldz t` (compress and decompress in memory, then compare). Every round trip was byte-identical. Measured on an Android phone in Termux, with 8 threads, using 0.9. The current version gives smaller files:
 
-| Model | 0.9 MiB | 0.12 MiB | Saved with 0.12 | 0.9 round trip | 0.12 round trip |
+| Model | 0.9 MiB | 0.13 MiB | Saved with 0.13 | 0.9 round trip | Current round trip |
 |---|---|---|---|---|---|
-| Qwen3.5-2B | 1111.3 | **1109.8** | 8.43% | 58 s | 35 s |
-| Qwen3-4B | 2073.3 | **2070.0** | 13.08% | 138 s | 47 s |
-| Qwen2.5-7B-Instruct | 4113.8 | **4111.0** | 7.95% | 220 s | 81 s |
+| Qwen3.5-2B | 1111.3 | **1109.8** | 8.43% | 58 s | 25 s |
+| Qwen3-4B | 2073.3 | **2070.0** * | 13.08% | 138 s | 47 s * |
+| Qwen2.5-7B-Instruct | 4113.8 | **4111.0** * | 7.95% | 220 s | 81 s * |
+
+\* measured with 0.12. These models have no Q8_0 tensors, so 0.13 gives the identical size; it compresses faster (Qwen3.5-2B: 35 → 25 s round trip).
+
+A Q8_0 model, same phone:
+
+| Model | Size MiB | 0.13 MiB | Saved | Round trip |
+|---|---|---|---|---|
+| Qwen3-0.6B-Q8_0 | 609.8 | **563.9** | 7.54% | 11 s |
 
 With `-H`, Qwen2.5-7B-Instruct came out 0.5 MiB larger (4111.5 MiB) with 19% less work (66 s round trip).
 
@@ -50,6 +58,7 @@ By tensor type, across the same models:
 | Q4_K | 6.9–8.5% | the bulk of every Q4_K_M file |
 | Q5_K | 6.8% | one model |
 | Q6_K | 6.3–8.8% | **23.2%** on Qwen3-4B (23.6% with 0.12), where the AWQ lattice model was chosen for 36 of 43 segments |
+| Q8_0 | 6.8% | Qwen3-0.6B-Q8_0, with 0.13 |
 | BF16 | 33.9% | one model |
 | F32 | 63–81% | norms and biases, small |
 | metadata | about 81% | tokenizer, tensor index |
@@ -74,7 +83,7 @@ Quantized weights are close to incompressible for general-purpose compressors; m
 |---|---|
 | Q4_K, Q5_K | Values as whole symbols from static tables (seed per file, differences per segment). Contexts: the block's zero point, extremes seen (0 and max), position. Headers (d, dmin, scales, mins) are coded adaptively with their own contexts. |
 | Q6_K | Values as whole symbols from static tables. Context: the column's running offset and width (mean and spread in units of the sub-block's step), position, extremes seen. Or, if smaller, the AWQ lattice model for models converted from 4-bit AWQ/GPTQ checkpoints (lattice steps and errors coded as symbols). |
-| Q8_0 | Context: the column's sign bias, extremes seen, average magnitude so far in the block. |
+| Q8_0 | Values as two 4-bit symbols (high nibble, then low nibble given the high one) from static tables. Context: the column's sign bias, extremes seen, average magnitude so far in the block. |
 | F32, F16, BF16 | Sign, exponent (context: previous exponent), mantissa (top bits given the exponent). |
 | Everything else | Byte-level context mixing: orders 0–6, a match model, and a small logistic mixer. |
 

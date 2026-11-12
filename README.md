@@ -2,21 +2,21 @@
 
 **Lossless compressor for GGUF models.** foldz shrinks quantized GGUF files (Q4_K_M and similar) by 7–13%, and decompression gives back the identical file, byte for byte. General-purpose compressors (zip, xz, zstd) gain very little on these files, because quantized weights look almost random to them.
 
-foldz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models fitted to the data itself, using a range coder. Quantized values are coded as whole symbols (Q8_0 as two 4-bit symbols) from static tables: the compressor counts the whole file first and stores one shared seed table per type, and each segment stores only how its tables differ from the seed. Decompression therefore learns nothing and is faster than compression. Everything else (metadata, other tensor types, padding) is coded with a byte-level context-mixing model. Nothing depends on the model's name or architecture.
+foldz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models fitted to the data itself, using a range coder. Quantized values are coded as whole symbols (Q8_0 and floats as 4-bit symbols) from static tables: the compressor counts the whole file first and stores one shared seed table per type, and each segment stores only how its tables differ from the seed. Decompression therefore learns nothing and is faster than compression. Everything else (metadata, other tensor types, padding) is coded with a byte-level context-mixing model. Nothing depends on the model's name or architecture. Safetensors files (F32, F16, BF16 tensors) are parsed the same way.
 
-> Status: **0.13, pre-release** (file format 13; files from older versions need the version that made them). The file format may change before 1.0; a `.foldz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
+> Status: **0.14, pre-release** (file format 14; files from older versions need the version that made them). The file format may change before 1.0; a `.foldz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
 ## Results
 
 Nine public Q4_K_M models, tested with `foldz t` (compress and decompress in memory, then compare). Every round trip was byte-identical. Measured on an Android phone in Termux, with 8 threads, using 0.9. The current version gives smaller files:
 
-| Model | 0.9 MiB | 0.13 MiB | Saved with 0.13 | 0.9 round trip | Current round trip |
+| Model | 0.9 MiB | Current MiB | Saved | 0.9 round trip | Current round trip |
 |---|---|---|---|---|---|
-| Qwen3.5-2B | 1111.3 | **1109.8** | 8.43% | 58 s | 25 s |
+| Qwen3.5-2B | 1111.3 | **1109.9** | 8.42% | 58 s | 24 s |
 | Qwen3-4B | 2073.3 | **2070.0** * | 13.08% | 138 s | 47 s * |
 | Qwen2.5-7B-Instruct | 4113.8 | **4111.0** * | 7.95% | 220 s | 81 s * |
 
-\* measured with 0.12. These models have no Q8_0 tensors, so 0.13 gives the identical size; it compresses faster (Qwen3.5-2B: 35 → 25 s round trip).
+Qwen3.5-2B measured with 0.14. \* measured with 0.12; later versions change these models' sizes by about 0.1 MiB (metadata in parallel pieces, tables for their small F32 tensors) and run faster (Qwen3.5-2B: 35 s with 0.12, 24 s with 0.14).
 
 A Q8_0 model, same phone:
 
@@ -84,7 +84,7 @@ Quantized weights are close to incompressible for general-purpose compressors; m
 | Q4_K, Q5_K | Values as whole symbols from static tables (seed per file, differences per segment). Contexts: the block's zero point, extremes seen (0 and max), position. Headers (d, dmin, scales, mins) are coded adaptively with their own contexts. |
 | Q6_K | Values as whole symbols from static tables. Context: the column's running offset and width (mean and spread in units of the sub-block's step), position, extremes seen. Or, if smaller, the AWQ lattice model for models converted from 4-bit AWQ/GPTQ checkpoints (lattice steps and errors coded as symbols). |
 | Q8_0 | Values as two 4-bit symbols (high nibble, then low nibble given the high one) from static tables. Context: the column's sign bias, extremes seen, average magnitude so far in the block. |
-| F32, F16, BF16 | Sign, exponent (context: previous exponent), mantissa (top bits given the exponent). |
+| F32, F16, BF16 | Each 16 bits as four 4-bit symbols from static tables: sign, exponent and top mantissa bits each given the ones above (the first also given the previous value); the low mantissa bits with little context, since they are close to random in trained weights. F32's low 16 bits the same way. |
 | Everything else | Byte-level context mixing: orders 0–6, a match model, and a small logistic mixer. |
 
 Safety and engineering:
@@ -137,7 +137,31 @@ To check a decompressed file against the original:
 cmp original.gguf restored.gguf && echo identical
 ```
 
+## Benchmarks on other machines
+
+All numbers above were measured on one Android phone. To measure on your machine:
+
+```
+gcc -O2 -pthread -ffp-contract=off -o foldz foldz.c -lm
+./bench.sh model.gguf [more files...]
+```
+
+`bench.sh` checks the round trip and prints a markdown table: foldz size, compress and decompress time, and `zstd -19 --long` and `xz -9` for comparison. The repository's **bench** workflow (Actions tab, Run workflow) does the same on a GitHub x86 runner with public models (by default Qwen2.5-0.5B-Instruct in Q4_K_M, Q8_0 and F16), so anyone can reproduce the numbers. Results from other machines are very welcome: open an issue with the table.
+
 ## Beyond GGUF
+
+### Safetensors
+
+foldz reads the safetensors header and codes F32, F16 and BF16 tensors with its float models; other tensor types and the header go to the byte model. One model, round trip on an Android phone with 8 cores:
+
+| File | Size | Byte model only (0.13) | Float models (0.13.1) | Static tables (0.14) | Round trip: 0.13 → 0.13.1 → 0.14 |
+|---|---|---|---|---|---|
+| model-bf16.safetensors | 256.6 MiB | 171.9 MiB (33.0%) | 169.7 MiB (33.8%) | **169.2 MiB (34.1%)** | 303 s → 7.1 s → **2.8 s** |
+| model.safetensors (F32, converted from BF16) | 513.2 MiB | 171.9 MiB (66.5%) | 167.6 MiB (67.3%) | **165.8 MiB (67.7%)** | 438 s → 8.4 s → **3.6 s** |
+
+The F32 file holds the same BF16 values with 16 zero bits added, and those cost almost nothing. As with GGUF, the gain on floats comes from the sign and exponent: the low mantissa bits of trained weights are close to random.
+
+### Other files
 
 Any other file is coded with the byte model alone. The other file types below were investigated while developing foldz. Full details, including methods and every measurement, are in [docs/FINDINGS.md](docs/FINDINGS.md).
 
@@ -169,7 +193,7 @@ The conclusion from all experiments: gains come from parsing the format and mode
 ## Limitations
 
 - **Supported tensor types:** Q4_K, Q5_K, Q6_K, Q8_0, F32, F16 and BF16. Other types (IQ quants, Q2_K, Q3_K, Q4_0...) are coded with the byte model, which gains little on them.
-- **Speed:** on a phone with 8 threads, about 50 MiB/s to compress and 80 MiB/s to decompress. Within a segment each value still waits for the one before it, so foldz is far slower than zstd to decompress. `-H` cuts the work by up to about 20% (measured on ARM; less on x86). The metadata segment is coded on one thread: on Qwen3.5-2B it now takes most of the decompression time, and on machines with many cores it can be the longest part of any run.
+- **Speed:** on a phone with 8 threads, about 50 MiB/s to compress and 80 MiB/s to decompress. Within a segment each value still waits for the one before it, so foldz is far slower than zstd to decompress. `-H` cuts the work by up to about 20% (measured on ARM; less on x86). The metadata (tokenizer data) is coded by a slower byte model, in 2 MiB pieces so that it runs in parallel. Most of the time goes into the quantized values: each one needs a context, a division and a table search in the range coder, and waits for the one before it.
 - **Format:** pre-1.0, so it may change between versions.
 
 ## Help wanted

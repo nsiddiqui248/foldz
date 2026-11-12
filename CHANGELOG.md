@@ -1,10 +1,53 @@
 # Changelog
 
-Changes per foldz version. The version and the file format share one number: foldz 0.13 writes and reads format 13. Until 1.0, a `.foldz` file only decompresses with the version that made it.
+Changes per foldz version. The version and the file format share one number: foldz 0.14 writes and reads format 14. Until 1.0, a `.foldz` file only decompresses with the version that made it.
 
 Each section below becomes the release notes when its tag (for example `v0.12`) is pushed; see `.github/workflows/release.yml`.
 
 ## [Unreleased]
+
+## [0.14] - 2026-11-12
+
+File format 14.
+
+### Changed
+- F32, F16 and BF16 values are coded as 4-bit symbols from static seed tables, like the quantized types, instead of bit by bit with adaptive probabilities. Each 16 bits are four nibbles: sign, exponent and top mantissa bits each given the ones above, the low mantissa bits with little context. Test files: about 2× faster to decompress, 0.1–1.1% smaller (BF16 −0.4%, F32 converted from BF16 −1.1%).
+- A segment can use the seed tables as they are, with no table section of its own, when that is cheaper: helps small segments.
+- Model metadata (tokenizer data) is split into 2 MiB pieces coded in parallel, instead of one segment on one thread. About 3% larger metadata (about 0.06 MiB on Qwen3.5-2B); helps small models and machines with many cores, where that one segment was the longest part of the run.
+
+### Added
+- `bench.sh`: compare foldz with zstd and xz on any machine, as a markdown table.
+- The `bench` workflow: runs `bench.sh` on a GitHub x86 runner with public models.
+
+### Removed
+- The per-segment list of raw segments added in 0.13.2; the report shows their count again. On real models they are tiny F32 tensors (16 values) that no coder can shrink.
+
+### Results
+- Safetensors, one model: BF16 169.7 → 169.2 MiB and 7.1 → 2.8 s round trip; F32 converted from BF16 167.6 → 165.8 MiB and 8.4 → 3.6 s.
+- Qwen3.5-2B: 1109.8 → 1109.9 MiB (+0.1 MiB from the metadata pieces and tables for tiny F32 tensors), 25.3 → 23.5 s round trip.
+
+## [0.13.2] - 2026-11-12
+
+File format 13, unchanged.
+
+### Added
+- The report lists segments stored raw (type, shape, size, offset, and how large coding made them), to find what foldz fails to shrink.
+
+### Investigated, not adopted
+- Folding 1, 2 and 3 times: no effect on Q4_K/Q5_K values (0–1 byte), 4–10% larger on floats, and foldz's compressed output stays incompressible for xz however often it is folded.
+
+## [0.13.1] - 2026-11-12
+
+File format 13, unchanged: 0.13 decompresses these files.
+
+### Added
+- Safetensors support: the compressor reads the JSON header and codes F32, F16 and BF16 tensors with the float models instead of the byte model. Test files: 17–20× faster to compress, 1.5–8.5% smaller. A header that does not parse falls back to the byte model.
+
+### Fixed
+- A file with no supported tensors passed an empty list to `qsort` with a null pointer (undefined behaviour, harmless in practice).
+
+### Investigated, not adopted
+- The fold on whole float values (BF16, F16, F32): 4–19% larger, because it mixes the sign, exponent and mantissa fields the model keeps apart.
 
 ## [0.13] - 2026-11-12
 

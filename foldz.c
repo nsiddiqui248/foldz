@@ -1,11 +1,11 @@
 /*
- * foldz 0.13 - lossless compressor for GGUF models (file format 13)
+ * foldz 0.14 - lossless compressor for GGUF models (file format 14)
  *
- * The version and the file format share one number: foldz 0.13 writes and reads format 13
- * (magic "FOLDZ13"). Until 1.0 the format may change between versions; a file is only
+ * The version and the file format share one number: foldz 0.14 writes and reads format 14
+ * (magic "FOLDZ14"). Until 1.0 the format may change between versions; a file is only
  * guaranteed to decompress with the version that made it. Check with: foldz v
  *
- * Works on any GGUF file: tensors of the supported types are coded with
+ * Works on GGUF and safetensors files (and, with the byte model alone, any other file): tensors of the supported types are coded with
  * context models learned from the data itself; every other byte (metadata,
  * tensor index, padding, unsupported tensor types) is coded with a byte-level
  * context-mixing model. Decompression gives back the identical file, byte for
@@ -27,8 +27,9 @@
  * so the output is never larger than the input (apart from a small index).
  *
  * Coder: range coder (LZMA style). Q4_K, Q5_K and Q6_K values are coded as whole
- * symbols, Q8_0 values as two 4-bit symbols (high, then low given high), all from
- * static tables: the compressor first counts every segment, builds one
+ * symbols, Q8_0 values as two 4-bit symbols (high, then low given high), F32, F16 and
+ * BF16 values as 4-bit symbols (each 16 bits as four, each given the ones above), all
+ * from static tables: the compressor first counts every segment, builds one
  * seed table per type for the whole file, and each segment then stores, per context,
  * either "use the seed" or its own table as differences from the seed. Decoding needs
  * no learning, so it is faster than compression. Everything else is adaptive: AWQ
@@ -89,8 +90,8 @@
 #include <sys/sysctl.h>
 #endif
 
-#define FOLDZ_VERSION "0.13"
-static const char MAGIC[8] = {'F','O','L','D','Z','1','3','\n'};    /* file format 13 */
+#define FOLDZ_VERSION "0.14"
+static const char MAGIC[8] = {'F','O','L','D','Z','1','4','\n'};    /* file format 14 */
 enum { T_F32 = 0, T_F16 = 1, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_BF16 = 30, T_BYTES = 0xFFFF };
 enum { M_NORMAL = 0, M_LATTICE = 1, M_RAW = 255 };
 /* flag in the mode field: block headers coded as symbols (-H). Faster to decode, slightly larger. */
@@ -649,39 +650,57 @@ static void q80_code(Coder *c, uint8_t *data, uint64_t rows, uint64_t ne0) {
 }
 
 /* ---------------- F32, F16, BF16 ---------------- */
-HOT void float_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t n, uint32_t type) {
-    Bit *sg = bits_new(4), *ex = bits_new(64 * 256), *mh = bits_new(64 * 256), *m1 = bits_new(256), *m0 = bits_new(256);
-    int ps = 0, pe = 0;
+/* Floats as 4-bit symbols from static tables. The high 16 bits (all of BF16 and F16; sign,
+   exponent and top mantissa bits of F32) are four nibbles a b c d, high first: a given the
+   previous value's a, b given a and the previous b, c given a b, d given c only: sign,
+   exponent and the top of the mantissa get the full context, the low mantissa bits (close to
+   random in trained weights) only a little, so their tables stay small. F32's low 16 bits
+   are close to random in trained weights (or all zero when converted from BF16), so each of
+   their nibbles only sees the one before it. Contexts: */
+#define FL_HI 544                                    /* 16 + 256 + 256 + 16 */
+#define FL_LO 64                                     /* F32 low half: each nibble given the one before */
+HOT int fl_nib(Coder *c, const int dec, const int ss, const int cn, size_t ctx, int v) {
+    if (cn) { c->cnt[ctx * 16 + v]++; return v; }
+    (void)ss;
+    return ssym(c, dec, c->stt + ctx * 16, 16, v);
+}
+HOT uint32_t fl_half(Coder *c, const int dec, const int ss, const int cn, uint32_t h, int *pa, int *pb) {
+    int a = fl_nib(c, dec, ss, cn, (size_t)*pa, (int)(h >> 12) & 15);
+    int b = fl_nib(c, dec, ss, cn, 16 + (size_t)((a << 4) | *pb), (int)(h >> 8) & 15);
+    int cc = fl_nib(c, dec, ss, cn, 272 + (size_t)((a << 4) | b), (int)(h >> 4) & 15);
+    int d = fl_nib(c, dec, ss, cn, 528 + (size_t)cc, (int)h & 15);
+    *pa = a; *pb = b;
+    return (uint32_t)((a << 12) | (b << 8) | (cc << 4) | d);
+}
+HOT uint32_t fl_low(Coder *c, const int dec, const int ss, const int cn, uint32_t l, int dprev) {
+    const size_t B = FL_HI;
+    int a = fl_nib(c, dec, ss, cn, B + (size_t)dprev, (int)(l >> 12) & 15);
+    int b = fl_nib(c, dec, ss, cn, B + 16 + (size_t)a, (int)(l >> 8) & 15);
+    int cc = fl_nib(c, dec, ss, cn, B + 32 + (size_t)b, (int)(l >> 4) & 15);
+    int d = fl_nib(c, dec, ss, cn, B + 48 + (size_t)cc, (int)l & 15);
+    return (uint32_t)((a << 12) | (b << 8) | (cc << 4) | d);
+}
+HOT void float_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t n, uint32_t type, const int ss, const int cn) {
+    int pa = 0, pb = 0;
     for (uint64_t i = 0; i < n; i++) {
         if (type == T_F32) {
             uint8_t *p = data + i * 4; uint32_t v = 0;
             if (!dec) memcpy(&v, p, 4);
-            int s = cbit(c, dec, &sg[ps], v >> 31); ps = s;
-            int e = ctree(c, dec, ex + clampi(pe - 96, 0, 63) * 256, 8, (v >> 23) & 255); pe = e;
-            int eb = clampi(e - 96, 0, 63);
-            uint32_t mt = (uint32_t)ctree(c, dec, mh + eb * 256, 7, (v >> 16) & 127);
-            uint32_t b1 = (uint32_t)ctree(c, dec, m1, 8, (v >> 8) & 255), b0 = (uint32_t)ctree(c, dec, m0, 8, v & 255);
-            v = ((uint32_t)s << 31) | ((uint32_t)e << 23) | (mt << 16) | (b1 << 8) | b0;
-            if (dec) memcpy(p, &v, 4);
+            uint32_t h = fl_half(c, dec, ss, cn, v >> 16, &pa, &pb);
+            uint32_t l = fl_low(c, dec, ss, cn, v & 0xFFFF, (int)(h & 15));
+            if (dec) { v = (h << 16) | l; memcpy(p, &v, 4); }
         } else {
-            uint8_t *p = data + i * 2; uint16_t v = dec ? 0 : rd16(p);
-            int s = cbit(c, dec, &sg[ps], v >> 15); ps = s;
-            if (type == T_BF16) {
-                int e = ctree(c, dec, ex + clampi(pe - 96, 0, 63) * 256, 8, (v >> 7) & 255); pe = e;
-                int m = ctree(c, dec, mh + clampi(e - 96, 0, 63) * 256, 7, v & 127);
-                v = (uint16_t)((s << 15) | (e << 7) | m);
-            } else {                                                     /* F16 */
-                int e = ctree(c, dec, ex + pe * 256, 5, (v >> 10) & 31); pe = e;
-                int mt = ctree(c, dec, mh + e * 256, 3, (v >> 7) & 7);
-                int ml = ctree(c, dec, m1, 7, v & 127);
-                v = (uint16_t)((s << 15) | (e << 10) | (mt << 7) | ml);
-            }
-            if (dec) wr16(p, v);
+            uint8_t *p = data + i * 2;
+            uint32_t h = fl_half(c, dec, ss, cn, dec ? 0 : rd16(p), &pa, &pb);
+            if (dec) wr16(p, (uint16_t)h);
         }
     }
-    free(sg); free(ex); free(mh); free(m1); free(m0);
 }
-MODEL(float_code, uint8_t *data X uint64_t n X uint32_t type, data X n X type)
+static void float_code(Coder *c, uint8_t *data, uint64_t n, uint32_t type) {
+    if (c->dec) { if (!c->stt) die("corrupt file"); float_code_impl(c, 1, data, n, type, 1, 0); }
+    else if (c->cnt_only) float_code_impl(c, 0, data, n, type, 0, 1);
+    else { if (!c->stt) die("internal: float segment without tables"); float_code_impl(c, 0, data, n, type, 1, 0); }
+}
 
 /* ---------------- other bytes: context mixing ---------------- */
 /* Predictors with the previous 0, 1, 2, 3, 4 and 6 bytes as context (orders 2+ hashed),
@@ -804,9 +823,13 @@ static void code_seg(Coder *c, Seg *s, uint8_t *p) {
 
 /* ---------------- static value tables ---------------- */
 /* types with static value tables (K-quants and Q8_0): index, symbols per context, contexts */
-#define NSTATIC 4
-static int kq_index(uint32_t type) { return type == T_Q4K ? 0 : type == T_Q5K ? 1 : type == T_Q6K ? 2 : type == T_Q8_0 ? 3 : -1; }
-static const int KQ_SYM[NSTATIC] = {16, 32, 64, 16}, KQ_CTX[NSTATIC] = {32 * 36, 64 * 36, Q6_CTX, Q8_CTX * 17};
+#define NSTATIC 7
+static int kq_index(uint32_t type) {
+    return type == T_Q4K ? 0 : type == T_Q5K ? 1 : type == T_Q6K ? 2 : type == T_Q8_0 ? 3 :
+           type == T_BF16 ? 4 : type == T_F16 ? 5 : type == T_F32 ? 6 : -1;
+}
+static const int KQ_SYM[NSTATIC] = {16, 32, 64, 16, 16, 16, 16},
+                 KQ_CTX[NSTATIC] = {32 * 36, 64 * 36, Q6_CTX, Q8_CTX * 17, FL_HI, FL_HI, FL_HI + FL_LO};
 /* segments coded with static tables: K-quants, not the lattice, not raw */
 static int is_static(const Seg *s) { return kq_index(s->type) >= 0 && (s->model & 255) == M_NORMAL; }
 
@@ -890,8 +913,35 @@ static void code_seeds(Coder *c, int dec, Seed sd[NSTATIC]) {
    "use the seed" or "own frequencies as differences from the seed". Fills the cumulative
    tables U for coding (unused contexts: the seed; contexts the seed lacks: uniform). */
 static void code_tables(Coder *c, int dec, const Seed *sd, const uint16_t *own, const uint32_t *ownN, int16_t *U) {
-    int k = sd->k; IntM m = intm_new(k); Bit um[2], om[2]; bits_init(um, 2); bits_init(om, 2);
+    int k = sd->k; IntM m = intm_new(k); Bit um[2], om[2], so; bits_init(um, 2); bits_init(om, 2); bits_init(&so, 1);
     int pu = 0, po = 0; uint16_t f[64];
+    /* first a flag: the whole segment uses the seed as it is, with no table section (small
+       segments, or ones like the seed); the encoder picks whichever its estimate makes cheaper */
+    int seed_only = 0;
+    if (!dec) {
+        double es_all = 0, sec = 0;
+        for (int x = 0; x < sd->nctx; x++) {
+            if (!sd->used[x] || !ownN[x]) { sec += sd->used[x] ? 0.2 : 0; continue; }
+            const uint16_t *fs = sd->f + (size_t)x * k, *fo = own + (size_t)x * k; double es = 0, eo = 0;
+            for (int i = 0; i < k; i++) {
+                double nn = (double)fo[i] * ownN[x] / SM;
+                if (fo[i]) { if (!fs[i]) es = 1e300; else es += nn * log2((double)SM / fs[i]); eo += nn * log2((double)SM / fo[i]); }
+                int d = (int)fo[i] - (int)fs[i], a = d < 0 ? -d : d, e = 0; while ((a >> (e + 1)) != 0) e++;
+                eo += d ? 2.0 * e + 3 : 0.3;
+            }
+            es_all += es; sec += 1.2 + (eo < es ? eo : es);
+        }
+        seed_only = es_all <= sec;
+    }
+    seed_only = cbit(c, dec, &so, seed_only);
+    if (seed_only) {
+        for (int x = 0; x < sd->nctx; x++) {
+            if (sd->used[x]) memcpy(f, sd->f + (size_t)x * k, (size_t)k * 2); else uniform_row(k, f);
+            cum_row(f, k, U + (size_t)x * k);
+        }
+        intm_free(&m);
+        return;
+    }
     for (int x = 0; x < sd->nctx; x++) {
         const uint16_t *fs = sd->f + (size_t)x * k;
         if (!sd->used[x]) { uniform_row(k, f); cum_row(f, k, U + (size_t)x * k); continue; }
@@ -944,8 +994,120 @@ static void skip_val(Rd *r, uint32_t t, int depth) {
 static int cmp_seg(const void *a, const void *b) {
     uint64_t x = ((const Seg *)a)->off, y = ((const Seg *)b)->off; return x < y ? -1 : x > y;
 }
+static Seg *build_segments(uint64_t n, uint64_t seg_target, uint64_t nt, uint32_t *types, uint64_t *offs,
+                           uint64_t *ne0s, uint64_t *nes, int *nseg);
+
+/* ---------------- safetensors ----------------
+   u64 header length H, then H bytes of JSON: {"name": {"dtype": "BF16", "shape": [rows, cols],
+   "data_offsets": [start, end]}, ..., "__metadata__": {...}}; tensor data follows, offsets relative
+   to its start, row-major (the last dimension is contiguous). Only what is needed is parsed; a
+   header that does not parse makes the file plain bytes. */
+typedef struct { const uint8_t *p; size_t n, i; int bad; } Js;
+static void js_ws(Js *j) { while (j->i < j->n && (j->p[j->i] == ' ' || j->p[j->i] == '\t' || j->p[j->i] == '\n' || j->p[j->i] == '\r')) j->i++; }
+static int js_eat(Js *j, char ch) { js_ws(j); if (j->i < j->n && j->p[j->i] == (uint8_t)ch) { j->i++; return 1; } return 0; }
+static void js_str(Js *j, char *out, size_t cap) {      /* a string; copied (truncated) into out if given */
+    size_t k = 0;
+    if (!js_eat(j, '"')) { j->bad = 1; return; }
+    while (j->i < j->n && j->p[j->i] != '"') {
+        if (j->p[j->i] == '\\') j->i++;
+        if (j->i < j->n && out && k + 1 < cap) out[k++] = (char)j->p[j->i];
+        j->i++;
+    }
+    if (j->i >= j->n) { j->bad = 1; return; }
+    j->i++; if (out) out[k] = 0;
+}
+static uint64_t js_uint(Js *j) {
+    js_ws(j); uint64_t v = 0; int any = 0;
+    while (j->i < j->n && j->p[j->i] >= '0' && j->p[j->i] <= '9') {
+        if (v > (UINT64_MAX - 9) / 10) { j->bad = 1; return 0; }
+        v = v * 10 + (j->p[j->i++] - '0'); any = 1;
+    }
+    if (!any) j->bad = 1;
+    return v;
+}
+static void js_skip(Js *j, int depth) {                  /* any value */
+    js_ws(j); if (j->i >= j->n || depth > 64) { j->bad = 1; return; }
+    uint8_t ch = j->p[j->i];
+    if (ch == '"') { js_str(j, NULL, 0); return; }
+    if (ch == '{' || ch == '[') {
+        uint8_t close = ch == '{' ? '}' : ']'; j->i++;
+        if (js_eat(j, (char)close)) return;
+        for (;;) {
+            if (ch == '{') { js_str(j, NULL, 0); if (!js_eat(j, ':')) { j->bad = 1; return; } }
+            js_skip(j, depth + 1); if (j->bad) return;
+            if (js_eat(j, ',')) continue;
+            if (js_eat(j, (char)close)) return;
+            j->bad = 1; return;
+        }
+    }
+    while (j->i < j->n && !strchr(",}] \t\r\n", j->p[j->i])) j->i++;   /* number, true, false, null */
+}
+static Seg *safetensors_segments(const uint8_t *p, size_t n, uint64_t seg_target, int *nseg) {
+    uint64_t H; memcpy(&H, p, 8);
+    if (H < 2 || H > n - 8) return NULL;
+    Js j = {p + 8, H, 0, 0};
+    uint64_t data = 8 + H, cap = 64, nt = 0;
+    uint32_t *types = xmalloc(cap * 4); uint64_t *offs = xmalloc(cap * 8), *ne0s = xmalloc(cap * 8), *nes = xmalloc(cap * 8);
+    if (!js_eat(&j, '{')) j.bad = 1;
+    if (!j.bad && !js_eat(&j, '}')) for (;;) {
+        char name[16]; js_str(&j, name, sizeof name); if (j.bad || !js_eat(&j, ':')) { j.bad = 1; break; }
+        if (!strcmp(name, "__metadata__")) js_skip(&j, 0);
+        else {
+            char dt[16] = ""; uint64_t ne = 1, e0 = 1, a = 0, b = 0; int have_off = 0;
+            if (!js_eat(&j, '{')) { j.bad = 1; break; }
+            if (!js_eat(&j, '}')) for (;;) {
+                char key[16]; js_str(&j, key, sizeof key); if (j.bad || !js_eat(&j, ':')) { j.bad = 1; break; }
+                if (!strcmp(key, "dtype")) js_str(&j, dt, sizeof dt);
+                else if (!strcmp(key, "shape")) {
+                    if (!js_eat(&j, '[')) { j.bad = 1; break; }
+                    if (!js_eat(&j, ']')) for (;;) {
+                        uint64_t d = js_uint(&j); e0 = d;               /* the last dimension is contiguous */
+                        if (__builtin_mul_overflow(ne, d, &ne)) j.bad = 1;
+                        if (j.bad) break;
+                        if (js_eat(&j, ',')) continue;
+                        if (!js_eat(&j, ']')) j.bad = 1;
+                        break;
+                    }
+                } else if (!strcmp(key, "data_offsets")) {
+                    if (!js_eat(&j, '[')) { j.bad = 1; break; }
+                    a = js_uint(&j); if (!js_eat(&j, ',')) j.bad = 1; b = js_uint(&j); if (!js_eat(&j, ']')) j.bad = 1;
+                    have_off = 1;
+                } else js_skip(&j, 0);
+                if (j.bad) break;
+                if (js_eat(&j, ',')) continue;
+                if (!js_eat(&j, '}')) j.bad = 1;
+                break;
+            }
+            if (j.bad) break;
+            uint32_t t = !strcmp(dt, "F32") ? T_F32 : !strcmp(dt, "F16") ? T_F16 : !strcmp(dt, "BF16") ? T_BF16 : 0xFFFFFFFFu;
+            int ti = type_index(t);
+            if (have_off && ti >= 0 && b >= a && b - a == ne * (uint64_t)TYPES[ti].bs && a <= n - data && b - a <= n - data - a) {
+                if (nt == cap) { cap *= 2; types = realloc(types, cap * 4); offs = realloc(offs, cap * 8);
+                                 ne0s = realloc(ne0s, cap * 8); nes = realloc(nes, cap * 8);
+                                 if (!types || !offs || !ne0s || !nes) die("out of memory"); }
+                types[nt] = t; offs[nt] = data + a; ne0s[nt] = e0 ? e0 : 1; nes[nt] = ne; nt++;
+            }
+        }
+        if (j.bad) break;
+        if (js_eat(&j, ',')) continue;
+        if (!js_eat(&j, '}')) j.bad = 1;
+        break;
+    }
+    if (j.bad) { free(types); free(offs); free(ne0s); free(nes); return NULL; }
+    /* overlapping tensors would fail later: drop such a header to the byte model instead */
+    for (uint64_t x = 0; x < nt; x++) for (uint64_t y = x + 1; y < nt && nt < 20000; y++) {
+        uint64_t ex = offs[x] + nes[x] * TYPES[type_index(types[x])].bs, ey = offs[y] + nes[y] * TYPES[type_index(types[y])].bs;
+        if (offs[x] < ey && offs[y] < ex) { free(types); free(offs); free(ne0s); free(nes); return NULL; }
+    }
+    return build_segments(n, seg_target, nt, types, offs, ne0s, nes, nseg);
+}
+
 static Seg *find_segments(const uint8_t *p, size_t n, uint64_t seg_target, int *nseg) {
     Rd r = {p, n, 0};
+    if (n >= 10 && memcmp(p, "GGUF", 4) && p[8] == '{') {   /* safetensors */
+        Seg *s = safetensors_segments(p, n, seg_target, nseg);
+        if (s) return s;
+    }
     if (n < 24 || memcmp(p, "GGUF", 4)) {           /* any other file: the byte model alone */
         Seg *s = NULL; int cnt = 0; uint64_t bt = (uint64_t)64 << 20;
         for (uint64_t a = 0; a < n; a += bt) {
@@ -964,9 +1126,8 @@ static Seg *find_segments(const uint8_t *p, size_t n, uint64_t seg_target, int *
         r.pos += kl; uint32_t t = ru32(&r);
         if (is_align && t == 4) { align = ru32(&r); if (!align) align = 32; } else skip_val(&r, t, 0);
     }
-    Seg *s = NULL; int cnt = 0, cap = 0;
-    uint64_t *offs = xmalloc(nt * 8), *ne0s = xmalloc(nt * 8), *nes = xmalloc(nt * 8);
-    uint32_t *types = xmalloc(nt * 4);
+    uint64_t *offs = xmalloc(nt * 8 + 8), *ne0s = xmalloc(nt * 8 + 8), *nes = xmalloc(nt * 8 + 8);
+    uint32_t *types = xmalloc(nt * 4 + 4);
     for (uint64_t i = 0; i < nt; i++) {
         uint64_t kl = ru64(&r); need(&r, kl); r.pos += kl;
         uint32_t nd = ru32(&r); if (nd > 8) die("bad tensor dims");
@@ -978,13 +1139,20 @@ static Seg *find_segments(const uint8_t *p, size_t n, uint64_t seg_target, int *
         types[i] = ru32(&r); offs[i] = ru64(&r); ne0s[i] = e0; nes[i] = ne;
     }
     uint64_t data = (r.pos + align - 1) / align * align;
+    for (uint64_t i = 0; i < nt; i++) if (__builtin_add_overflow(data, offs[i], &offs[i])) die("tensor beyond end of file");
+    return build_segments(n, seg_target, nt, types, offs, ne0s, nes, nseg);
+}
+/* tensors (type, absolute offset, first dimension, element count) -> segments; every byte not in
+   a supported tensor goes to byte-model segments. Takes ownership of the four arrays. */
+static Seg *build_segments(uint64_t n, uint64_t seg_target, uint64_t nt, uint32_t *types, uint64_t *offs,
+                           uint64_t *ne0s, uint64_t *nes, int *nseg) {
+    Seg *s = NULL; int cnt = 0, cap = 0;
     for (uint64_t i = 0; i < nt; i++) {
         int ti = type_index(types[i]); if (ti < 0) continue;
         uint64_t e0 = ne0s[i], ne = nes[i]; int vpb = TYPES[ti].vpb, bs = TYPES[ti].bs;
         if (!e0 || !ne || e0 % vpb || ne % e0) continue;
-        uint64_t rows = ne / e0, rowb = e0 / vpb * bs, off, tb;
-        if (__builtin_add_overflow(data, offs[i], &off) || __builtin_mul_overflow(rows, rowb, &tb)
-            || off > n || tb > n - off) die("tensor beyond end of file");
+        uint64_t rows = ne / e0, rowb = e0 / vpb * bs, off = offs[i], tb;
+        if (__builtin_mul_overflow(rows, rowb, &tb) || off > n || tb > n - off) die("tensor beyond end of file");
         uint64_t rps = seg_target / rowb; if (rps < 1) rps = 1;
         for (uint64_t r0 = 0; r0 < rows; r0 += rps) {
             uint64_t nr = rows - r0 < rps ? rows - r0 : rps;
@@ -993,12 +1161,16 @@ static Seg *find_segments(const uint8_t *p, size_t n, uint64_t seg_target, int *
         }
     }
     free(offs); free(ne0s); free(nes); free(types);
-    qsort(s, cnt, sizeof *s, cmp_seg);
+    if (cnt) qsort(s, cnt, sizeof *s, cmp_seg);
     for (int i = 1; i < cnt; i++) if (s[i].off < s[i - 1].off + s[i - 1].size) die("overlapping tensors");
     int nt_seg = cnt; uint64_t at = 0;
     for (int i = 0; i <= nt_seg; i++) {
         uint64_t end = i < nt_seg ? s[i].off : n;
-        uint64_t bt = (uint64_t)64 << 20;           /* keep metadata whole: the match model needs its history */
+        /* metadata in 2 MiB pieces, coded in parallel: costs about 3% of the metadata's coded size
+           (each piece learns from scratch), but a model's metadata (10+ MiB of tokenizer data) is
+           otherwise one segment on one thread, the longest of the run on small models and on
+           machines with many cores */
+        uint64_t bt = (uint64_t)2 << 20;
         for (uint64_t a = at; a < end; a += bt) {
             uint64_t len = end - a < bt ? end - a : bt;
             if (cnt == cap) { cap = cap * 2 + 64; s = realloc(s, cap * sizeof *s); if (!s) die("out of memory"); }
@@ -1006,7 +1178,7 @@ static Seg *find_segments(const uint8_t *p, size_t n, uint64_t seg_target, int *
         }
         if (i < nt_seg) at = s[i].off + s[i].size;
     }
-    qsort(s, cnt, sizeof *s, cmp_seg);
+    if (cnt) qsort(s, cnt, sizeof *s, cmp_seg);
     *nseg = cnt; return s;
 }
 
@@ -1414,7 +1586,7 @@ static void cmd_decompress(const char *in, const char *out, int threads, uint64_
     if (n < HDR) die("not a foldz file");
     if (memcmp(p, MAGIC, 8)) {
         if (!memcmp(p, "FOLDZ", 5) && p[7] == '\n')
-            fprintf(stderr, "foldz: file format %.2s, but foldz " FOLDZ_VERSION " reads only format 13: "
+            fprintf(stderr, "foldz: file format %.2s, but foldz " FOLDZ_VERSION " reads only format 14: "
                             "use the foldz version that made it\n", (const char *)p + 5), exit(1);
         die("not a foldz file");
     }
@@ -1483,7 +1655,7 @@ static void check_output(const char *in, const char *out, int force) {
 int main(int argc, char **argv) {
     init_tables(); init_stretch();
     if (argc == 2 && (argv[1][0] == 'v' || !strcmp(argv[1], "--version"))) {
-        printf("foldz " FOLDZ_VERSION " (file format 13)\n"); return 0;
+        printf("foldz " FOLDZ_VERSION " (file format 14)\n"); return 0;
     }
     if (argc < 3) {
         fprintf(stderr, "usage: foldz c in [out.foldz] [-t threads] [-s segment_MiB] [-m MiB] [-H] [-f]\n"

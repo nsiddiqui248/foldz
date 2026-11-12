@@ -1,0 +1,39 @@
+# Run by hand (Actions tab -> bench -> Run workflow): downloads public models, runs bench.sh
+# on a GitHub x86 runner, and shows the table in the run's summary (also kept as an artifact).
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "Model URLs, separated by spaces"
+        default: >-
+          https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+          https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q8_0.gguf
+          https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-f16.gguf
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          sudo apt-get install -y zstd xz-utils > /dev/null
+          gcc -O2 -Wall -pthread -ffp-contract=off -o foldz foldz.c -lm
+      - name: Download models
+        run: |
+          mkdir models
+          for u in ${{ github.event.inputs.urls }}; do
+            curl -fsSL --retry 3 -o "models/$(basename "${u%%\?*}")" "$u"
+          done
+          ls -l models
+      - name: Benchmark
+        run: |
+          ./bench.sh models/* | tee bench.md
+          cat bench.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: bench.md

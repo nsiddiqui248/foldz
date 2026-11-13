@@ -8,6 +8,74 @@ Each section below becomes the release notes when its tag (for example `v0.17`) 
 
 ## [Unreleased]
 
+## [0.20] - 2026-11-13
+
+File format 20.
+
+### Changed
+- **Q6_K scales: the low nibble is given the high nibble and the whole previous scale**, not just the previous scale's high nibble. Both Q6_K models. Scale bits −9% on AWQ-style test data.
+- **Lattice: lanes over consecutive sub-blocks.** Lane L takes sub-blocks 4L … 4L+3, so a lane's previous lattice size is usually the previous sub-block's. The normal model keeps L, L+4, L+8, L+12; its only within-block context restarts every sub-block, so the layout doesn't matter there.
+- **Segment size follows the file size** when `-s` isn't given: 1/24 of the file, from 8 to 48 MiB, so files above about 1.1 GB keep 48 MiB. A small file's largest segment no longer runs alone at the end (a 256.6 MiB BF16 model ran at 75% thread use, its 48 MiB segment taking 2.1 s of 2.8 s). It depends on the file size only, so a file splits the same way on every machine.
+- **Lattice: the step k is also given its column**, over the rows above:
+  - the share of positive k, as Q4_0's 8 buckets (k = 0 is a zero weight, so this is the weight's sign bias);
+  - the average |k| / m, in 4 buckets.
+  Per row, the buckets are a reciprocal and three thresholds (⌊sum/r⌋ > 10 ⇔ sum ≥ 11r), and |k|·32/m comes from a table, so decoding does no division. k has 66 × 32 context rows, up from 66.
+
+### Results
+- AWQ-style test data (4-bit weights with a scale and zero per 128, then llama.cpp's Q6_K quantizer; 19 MiB): 0.18's adaptive lattice 3.676 bits/weight, 0.19 3.701, 0.20 **3.612** (1.7% below 0.18, 2.4% below 0.19). The two column contexts give most of it, the scale context about 1%. Lattice decoding about 15% slower than 0.19 (0.47 → 0.57 s).
+- Normal Q6_K test data: unchanged (its synthetic scales are random; real scales may gain).
+- Q4_0, tried and not kept: a start table for the symbol search (10% slower), 8 rANS lanes (6% slower on x86, which runs out of registers; ARM has twice as many and might differ), division-free encoding by reciprocal (exact, but no faster). Q4_0 is unchanged from 0.19, which already took 22% less time per GiB round trip than 0.18 (63 → 49 s per GiB, x86, one thread).
+- Phone, `tenz t`: Llama-3.2-1B-Instruct BF16 safetensors 2357.1 → 1549.8 MiB (34.25% saved), 21 s, 100% thread use. Qwen3.5-2B 1108.4 → 1108.5 MiB: the scale context gains nothing on its normal Q6_K, and its larger tables cost a little per segment. Synthetic 254.5 MiB BF16 safetensors with the new segment size: slowest segment 6.9 → 1.7 s, same size.
+- Gemma 4 31B Q4_0, phone, `tenz t`: Q6_K (all lattice) 729.1 MiB (0.19) → **718.5 MiB**, also 1.1% below 0.18's adaptive lattice (726.3); file 14705.4 → **14694.9 MiB (12.70% saved)**, the smallest yet. Round trip 258 s (225 s for 0.19 on a cooler run): Q6_K work 222 → 262 thread-seconds, from the slower lattice decoding and the richer contexts in counting; Q4_0 1546 → 1761 thread-seconds with unchanged code, which is heat.
+- The 256.6 MiB BF16 model with the new segment size: 10 MiB segments, slowest 2.1 → 0.5 s, thread use 75% → 99%, round trip 2.8 → 2.1 s.
+
+## [0.19] - 2026-11-13
+
+File format 19.
+
+### Changed
+- **The Q6_K lattice model in static tables and rANS lanes.** It was the last adaptive model on the range coder, and Gemma's slowest segments. Now it has its own static table set (table index 8), the normal model's headers, lanes and chunks, and these symbols:
+  - per 16-value sub-block, in its lane: the lattice size m given the lane's previous m, then the span given m / 4;
+  - per value: k + 32 given 2m + (k = −m seen), then the error e + 3 in 0..6 given m, or 7 and the value itself (escape).
+  The number of symbols per block varies with the escapes, so the encoder records each chunk's symbols in the decoder's order (lane, row, symbol) and codes them backwards. Chunks are 512 blocks.
+- **Pass 1 chooses the lattice by counts.** It counts both models and keeps the one whose counts have the lower entropy, both now being static. Before, the lattice was coded adaptively in pass 1 and finished there.
+- **Q4_0 context in fewer operations.** The column's share of positive weights is one multiplication by a per-row reciprocal (in 1/32 steps, mapped to the same 8 buckets by their midpoints), instead of 7 threshold compares. The running average is one table load by (position, sum so far), instead of a multiply and a clamp.
+- **`-H` is accepted and ignored**, since every block header is now coded as symbols. Files carry no header flag any more.
+- **Faster lattice fit, same result.** Its cost estimate has a floor that rises with the lattice size (16·log₂(2m+1) bits), so the search stops once that floor reaches the best cost found. Output is identical; compressing noisy lattice data took 23% less time.
+- **Removed:** the adaptive symbol coder and the adaptive fp16 coder, now unused.
+
+### Results
+- Synthetic lattice data (9.6 MiB of Q6_K on a 15-level grid), x86, one thread, lattice forced in both versions: decoding 0.75 → 0.2 s (3.7× faster), 38.33% → 38.42% saved. Compression 0.8 → 1.1 s: pass 1 counts both models, and pass 2 fits the lattice again.
+- Synthetic Q4_0, decoding by CPU time, best of 7 runs: 37.6–38.5 → 40.6–45.0 MiB/s, same size (18.5% saved).
+- Gemma 4 31B Q4_0, phone, `tenz t`, against 0.18: round trip 341 → 267 s (−22%), pass 1 84 → 49 s (the lattice is no longer coded adaptively there), slowest segment 12.6 → 8.3 s, thread use 100%. Q4_0 work 2421 → 1838 thread-seconds, though heat varies between runs (1723 with 0.17). Q6_K work barely changed (261 → 250): decoding is faster, but the encoder fitted the lattice in both passes (before the faster fit above). Size: Q6_K 726.3 → 729.1 MiB, as the static lattice codes 0.4% worse than the adaptive one; Q4_0 13973.6 → 13972.0 MiB; file 14704.2 → 14705.4 MiB.
+- With the faster lattice fit: Gemma round trip 225 s (pass 1 40 s, Q6_K 221 thread-seconds, slowest segment 6.6 s); Qwen3.5-2B 17.0 s. Over the 0.18 → 0.19 work, Gemma went 341 → 225 s.
+- Qwen3.5-2B: 17.4 s, 100% thread use, same size.
+
+## [0.18] - 2026-11-13
+
+File format 18.
+
+### Changed
+- **Q6_K in rANS lanes.** The normal Q6_K model (not the lattice) codes whole blocks from static tables in 4 rANS lanes, like Q4_K:
+  - Headers: block b's header goes in lane b % 4, with the lane's previous block as history. d is four nibbles with the float contexts. Each scale (int8 + 128) is a high nibble given the previous scale, then a low nibble given the high one and the previous scale's high nibble. Before, they were adaptive, bit by bit.
+  - Values: same contexts as before (column offset and width, position, values ≤ 1 seen). Lane L takes sub-blocks L, 4 + L, 8 + L and 12 + L, since the only context inside a block restarts at every 16-value sub-block.
+  - Chunks: the column sums are doubles, and rANS encodes in reverse, so the encoder cannot run them backwards exactly (Q4_0's integer counts can be). Each segment is cut into streams of 2048 blocks (u32 word count, 4 lane states, words). The encoder computes a chunk's contexts forward, then codes it backwards. The cost is 20 bytes per chunk.
+  - Context arithmetic: the divisions by the row count and by the step became multiplications by their reciprocals, computed once per block and sub-block, and the rounding no longer calls `rint`. All still exact IEEE operations, so files stay identical on every platform.
+- **Pass 1 codes Q6_K at most once.** The normal model's size is estimated from its counts (their entropy) instead of coding it adaptively. Only the lattice is coded, and only when a sample suggests it.
+- **`-H` now only affects lattice Q6_K segments**, the last ones with adaptive headers.
+- **Scheduling weights brought up to date.** Segments start longest first, by size times a per-type weight relative to Q4_K. The old weights (byte model 12×, Q6_K 2×) made a 2 MiB metadata piece look shorter than a 48 MiB tensor segment, though it takes about twice as long; such a piece then ran alone at the end. New weights from the measurements below: byte model 25×, lattice Q6_K 3×, Q8_0 2× (estimated), Q4_0 1.6×, Q6_K 1.1× (2× in pass 1, which may try the lattice), Q5_K 0.85×.
+- **The report lists raw segments by type**, with their count, total size and largest size.
+- **Live memory check no longer stalls on small swings.** The budget already keeps the device's reserve free, but each new segment also required its need plus the full reserve to be free right then. Once tenz held most of its budget, free memory sat at that line, and every swing of a few MiB stalled threads. Now the live reading only lowers the budget when other apps have taken memory since the start: by what the device lost beyond what tenz holds, less a slack of 1/8 of the budget + 64 MiB.
+- **rANS segments need half the memory, and the estimate says so.** The range coder that writes a rANS segment's table section had a buffer as large as the segment, though the tables need a small fraction of it; it is now sized to the tables. The estimate counted the output twice: a 48 MiB Q4_0 segment was estimated at 193 MiB in `tenz t` (it held 144 MiB), so an 872 MiB budget ran only 4 segments at once. Now 97 MiB, 8 at once. The startup message shows the larger need of the two passes; it showed only pass 1's.
+- **The report shows where idle time goes**: each pass's wall time and thread use, the time between and around the passes (one thread builds the seed tables), thread-seconds spent waiting for memory, and segment time spent off the CPU (reading the input from storage, or waiting for a core).
+
+### Results
+- Synthetic Q6_K (llama.cpp's quantizer on Student-t weights with per-column bias and scale, 32 MiB), x86, one thread: decoding 1.9 → 1.05 s (1.8× faster), compression 1.8 → 1.2 s, size 11.50% → 11.53% saved. Without the column context, decoding would take 0.85 s.
+- On grid-shaped test data (AWQ-like), the static normal model now beats the adaptive lattice (39.7% against 38.1% saved), so tenz picks it there.
+- Qwen3.5-2B, phone, `tenz t` against 0.17: Q6_K work 104.3 → 47.5 thread-seconds (2.2× faster), total 176 → 123, round trip 22.1 → 17.2 s, file 1108.7 → 1108.4 MiB. Thread use was 89%: the slowest segment was a 2 MiB metadata piece (4.6 s) that started late, fixed by the new scheduling weights above.
+- With the new weights: Qwen3.5-2B thread use 89% → 93%. The raw segments are tiny F32 tensors: Qwen3.5-2B 18 of 64 bytes, Gemma 60 of 4 bytes (one number per layer), too small to carry the coded form's fixed costs. Gemma's thread use went 94% → 89% → 78% over three runs as its budget fell (1247, 1220, 893 MiB). The new report showed why: pass 1 at 100%, pass 2 at 71%, with 659 thread-seconds waiting for memory. The live-check fix above did not change it (713 thread-seconds on the next run): the budget itself was full, because of the overestimated segment memory, fixed above. The report now splits waiting for memory into budget full and other apps holding memory. With the fix: Gemma 100% thread use in both passes and no waiting for memory, round trip 341 s; Qwen3.5-2B 99%, 18.9 s. Reading the 16.8 GB input from storage cost 163 thread-seconds (7% of the work).
+- Gemma 4 31B Q4_0: the lattice was still chosen for all 23 Q6_K segments, same size. Q6_K work 320.8 → 247.8 thread-seconds, as pass 1 no longer codes Q6_K twice (82 → 74 s); round trip 328 → 304 s, thread use 79% → 94%.
+
 ## [0.17] - 2026-11-13
 
 File format 17. First version named tenz, pre-release.

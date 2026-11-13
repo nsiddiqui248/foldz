@@ -21,7 +21,7 @@ jobs:
       - name: Build
         run: |
           sudo apt-get install -y zstd xz-utils > /dev/null
-          gcc -O2 -Wall -pthread -ffp-contract=off -o foldz foldz.c -lm
+          gcc -O2 -Wall -pthread -ffp-contract=off -o tenz tenz.c -lm
       - name: Download models
         run: |
           mkdir models

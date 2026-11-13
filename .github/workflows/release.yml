@@ -1,4 +1,4 @@
-# On every pushed tag vX.Y (or vX.Y.Z): check that foldz.c has that version, build it,
+# On every pushed tag vX.Y (or vX.Y.Z): check that tenz.c has that version, build it,
 # run a round trip, and publish a GitHub Release whose notes are that version's
 # section of CHANGELOG.md. The release fails if the section is missing.
 name: release
@@ -16,11 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Version in foldz.c must match the tag
+      - name: Version in tenz.c must match the tag
         run: |
           ver="${GITHUB_REF_NAME#v}"
-          grep -q "#define FOLDZ_VERSION \"$ver\"" foldz.c || {
-            echo "::error::tag $GITHUB_REF_NAME but foldz.c says: $(grep '#define FOLDZ_VERSION' foldz.c)"; exit 1; }
+          grep -q "#define TENZ_VERSION \"$ver\"" tenz.c || {
+            echo "::error::tag $GITHUB_REF_NAME but tenz.c says: $(grep '#define TENZ_VERSION' tenz.c)"; exit 1; }
 
       - name: Release notes from CHANGELOG.md
         run: |
@@ -37,15 +37,15 @@ jobs:
 
       - name: Build and round trip
         run: |
-          gcc -O2 -Wall -pthread -ffp-contract=off -o foldz foldz.c -lm
-          ./foldz v
-          ./foldz t foldz.c            # byte-model round trip; exits non-zero if it differs
+          gcc -O2 -Wall -pthread -ffp-contract=off -o tenz tenz.c -lm
+          ./tenz v
+          ./tenz t tenz.c            # byte-model round trip; exits non-zero if it differs
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" foldz.c \
-            --title "foldz ${GITHUB_REF_NAME#v}" \
+          gh release create "$GITHUB_REF_NAME" tenz.c \
+            --title "tenz ${GITHUB_REF_NAME#v}" \
             --notes-file notes.md \
             --prerelease

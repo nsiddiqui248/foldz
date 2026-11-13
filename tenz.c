@@ -1,19 +1,23 @@
 /*
- * foldz 0.14 - lossless compressor for GGUF models (file format 14)
+ * tenz 0.17 - lossless compressor for GGUF models (file format 17)
  *
- * The version and the file format share one number: foldz 0.14 writes and reads format 14
- * (magic "FOLDZ14"). Until 1.0 the format may change between versions; a file is only
- * guaranteed to decompress with the version that made it. Check with: foldz v
+ * Successor of foldz (versions 0.9 to 0.15; 0.16 was never released). The numbers continue:
+ * foldz files need the foldz version that made them.
+ *
+ * The version and the file format share one number: tenz 0.17 writes and reads format 17
+ * (magic "TENZ17"). Until 1.0 the format may change between versions; a file is only
+ * guaranteed to decompress with the version that made it. Check with: tenz v
  *
  * Works on GGUF and safetensors files (and, with the byte model alone, any other file): tensors of the supported types are coded with
  * context models learned from the data itself; every other byte (metadata,
- * tensor index, padding, unsupported tensor types) is coded with a byte-level
- * context-mixing model. Decompression gives back the identical file, byte for
+ * tensor index, padding) is coded with a byte-level context-mixing model. GGUF tensors
+ * of other types are stored as they are (the byte model gains little on them and is slow). Decompression gives back the identical file, byte for
  * byte. Nothing depends on the model's name or architecture.
  *
  * Supported types and models
  *   Q4_K, Q5_K  values: whole symbols, context: zero point, extremes seen
- *               (0 and max), position. Header: d, dmin (fp16), scales, mins.
+ *               (0 and max), position. Header: d, dmin (fp16, as nibbles), scales, mins
+ *               (high 2 bits, low 4 bits). Whole blocks in 4 rANS lanes.
  *   Q6_K        values: context = column offset and width (running mean and
  *               spread of the column, in units of the sub-block's step),
  *               position, low values seen (whole symbols); or, if smaller, the AWQ lattice
@@ -21,6 +25,8 @@
  *               (models converted from 4-bit AWQ/GPTQ checkpoints).
  *   Q8_0        values: context = column sign bias, extremes seen, average
  *               magnitude so far in the block. Header: d (fp16).
+ *   Q4_0        values: context = column sign bias, q = 0 seen, average |q - 8| so far,
+ *               position. Header: d (fp16, as nibbles). Whole blocks in 4 rANS lanes.
  *   F32, F16, BF16  sign, exponent (context: previous exponent), mantissa
  *               (top bits given the exponent).
  * Safety: every segment whose coded size would not be smaller is stored raw,
@@ -28,27 +34,28 @@
  *
  * Coder: range coder (LZMA style). Q4_K, Q5_K and Q6_K values are coded as whole
  * symbols, Q8_0 values as two 4-bit symbols (high, then low given high), F32, F16 and
- * BF16 values as 4-bit symbols (each 16 bits as four, each given the ones above), all
- * from static tables: the compressor first counts every segment, builds one
+ * BF16 values as 4-bit symbols (each 16 bits as four, each given the ones above); Q4_K,
+ * Q5_K and Q4_0 blocks (headers and values) and float values are coded with interleaved rANS
+ * (4 lanes, decoded without divisions), the rest with the range coder; all from static tables: the compressor first counts every segment, builds one
  * seed table per type for the whole file, and each segment then stores, per context,
  * either "use the seed" or its own table as differences from the seed. Decoding needs
  * no learning, so it is faster than compression. Everything else is adaptive: AWQ
  * lattice values as symbols, the rest bit by bit (probabilities updated like the KT
  * estimator). With -H the block headers of
- * Q4_K, Q5_K and Q6_K are also coded as symbols: faster, about 0.05% larger. Big tensors are split into segments that are coded
+ * Q6_K are also coded as symbols: faster, slightly larger. Big tensors are split into segments that are coded
  * independently, in parallel. Contexts use only exact or IEEE-754 arithmetic
  * (no libm functions except exact ones), so files decode identically on any
  * platform.
  *
- * Build:  gcc -O2 -pthread -ffp-contract=off -o foldz foldz.c -lm
+ * Build:  gcc -O2 -pthread -ffp-contract=off -o tenz tenz.c -lm
  *         (clang, e.g. Termux: same flags). Requires IEEE double arithmetic without excess
  *         precision or fused multiply-add, so that every platform computes the same contexts:
  *         64-bit x86, ARM and RISC-V are fine; 32-bit x86 needs -msse2 -mfpmath=sse.
  *         The build stops with an error where this can't be guaranteed (x87 maths, -ffast-math).
  * Platforms: Linux, Android (Termux), macOS, BSD. Windows: use WSL (needs mmap and pwrite).
- * Usage:  foldz c model.gguf model.foldz [-t threads] [-s segment_MiB] [-m MiB] [-H]
- *         foldz d model.foldz model.gguf [-t threads] [-m MiB]
- *         foldz t model.gguf [-t threads] [-s segment_MiB] [-m MiB] [-H]   (round trip in memory)
+ * Usage:  tenz c model.gguf model.tenz [-t threads] [-s segment_MiB] [-m MiB] [-H]
+ *         tenz d model.tenz model.gguf [-t threads] [-m MiB]
+ *         tenz t model.gguf [-t threads] [-s segment_MiB] [-m MiB] [-H]   (round trip in memory)
  * Memory: segments start only while their estimated memory fits in what the device has free,
  *         keeping a reserve for the system and other apps; -m sets a fixed limit instead.
  */
@@ -56,10 +63,10 @@
 #define _GNU_SOURCE
 #include <float.h>
 #if defined(_WIN32) && !defined(__CYGWIN__)
-#error "foldz needs POSIX mmap and pwrite: build it under WSL (or Cygwin)"
+#error "tenz needs POSIX mmap and pwrite: build it under WSL (or Cygwin)"
 #endif
 #if defined(__FAST_MATH__)
-#error "do not build foldz with -ffast-math: contexts must be computed identically everywhere"
+#error "do not build tenz with -ffast-math: contexts must be computed identically everywhere"
 #endif
 #if !defined(FLT_EVAL_METHOD) || FLT_EVAL_METHOD != 0
 #error "floating point uses excess precision (x87): on 32-bit x86 build with -msse2 -mfpmath=sse"
@@ -90,23 +97,24 @@
 #include <sys/sysctl.h>
 #endif
 
-#define FOLDZ_VERSION "0.14"
-static const char MAGIC[8] = {'F','O','L','D','Z','1','4','\n'};    /* file format 14 */
-enum { T_F32 = 0, T_F16 = 1, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_BF16 = 30, T_BYTES = 0xFFFF };
+#define TENZ_VERSION "0.17"
+#define TENZ_FORMAT "17"                               /* the number in MAGIC */
+static const char MAGIC[8] = {'T','E','N','Z','1','7','\n', 0};    /* file format 17 */
+enum { T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_BF16 = 30, T_BYTES = 0xFFFF };
 enum { M_NORMAL = 0, M_LATTICE = 1, M_RAW = 255 };
-/* flag in the mode field: block headers coded as symbols (-H). Faster to decode, slightly larger. */
+/* flag in the mode field: Q6_K block headers coded as symbols (-H). Faster to decode, slightly larger. */
 enum { H_SYM = 0x100 };
 
 typedef struct { uint32_t id; int vpb, bs; const char *name; } TypeInfo;
 static const TypeInfo TYPES[] = {
     {T_Q4K, 256, 144, "Q4_K"}, {T_Q5K, 256, 176, "Q5_K"}, {T_Q6K, 256, 210, "Q6_K"},
-    {T_Q8_0, 32, 34, "Q8_0"}, {T_BF16, 1, 2, "BF16"}, {T_F16, 1, 2, "F16"}, {T_F32, 1, 4, "F32"},
+    {T_Q4_0, 32, 18, "Q4_0"}, {T_Q8_0, 32, 34, "Q8_0"}, {T_BF16, 1, 2, "BF16"}, {T_F16, 1, 2, "F16"}, {T_F32, 1, 4, "F32"},
     {T_BYTES, 1, 1, "other"},            /* metadata, tensor index, padding, unsupported tensor types */
 };
 #define NTYPES (int)(sizeof TYPES / sizeof TYPES[0])
 static int type_index(uint32_t id) { for (int i = 0; i < NTYPES; i++) if (TYPES[i].id == id) return i; return -1; }
 
-static void die(const char *m) { fprintf(stderr, "foldz: %s\n", m); exit(1); }
+static void die(const char *m) { fprintf(stderr, "tenz: %s\n", m); exit(1); }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) die("out of memory (try fewer threads: -t 2)"); return p; }
 
@@ -229,9 +237,9 @@ static void sym_halve(int16_t *U, int n) {
 /* The search and the update below work on 8 counts at a time with the GCC/Clang generic vector
    type. It is not tied to any CPU: the compiler turns it into SSE2 or AVX on x86, NEON on ARM,
    the vector extension on RISC-V, or ordinary scalar code where there is none. Only integer
-   adds and compares are used, so every CPU produces the same bytes. FOLDZ_SCALAR (or a compiler
+   adds and compares are used, so every CPU produces the same bytes. TENZ_SCALAR (or a compiler
    without the extension) selects plain loops that give identical output. */
-#if !defined(FOLDZ_SCALAR) && (defined(__GNUC__) || defined(__clang__))
+#if !defined(TENZ_SCALAR) && (defined(__GNUC__) || defined(__clang__))
 #define SYM_VEC 1
 typedef int16_t V8 __attribute__((vector_size(16)));
 static const V8 IOTA8 = {0, 1, 2, 3, 4, 5, 6, 7};
@@ -383,72 +391,6 @@ static void k_pack_vals(uint8_t *B, int bits, const uint8_t *q) {
     }
 }
 
-/* ss: values from static tables; cn: encoder pass 1, count values only (nothing is coded) */
-HOT void kq_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t nblocks, const int bits, const int sh, const int ss, const int cn) {
-    int bs = bits == 4 ? 144 : 176, maxv = (1 << bits) - 1, zmax = bits == 4 ? 31 : 63;
-    size_t nctx = (size_t)(zmax + 1) * 36;
-    Bit *dhi = NULL, *dlo = NULL, *mhi = NULL, *mlo = NULL, *msc = NULL, *mmn = NULL;
-    F16S fd = {0}, fm = {0}; int16_t *ssc = NULL, *smn = NULL;
-    if (cn) {}
-    else if (sh) { fd = f16s_new(); fm = f16s_new(); ssc = sym_new(64, 64); smn = sym_new(4096, 64); }
-    else { dhi = bits_new(65536); dlo = bits_new(65536); mhi = bits_new(65536); mlo = bits_new(65536);
-           msc = bits_new(64 * 64); mmn = bits_new(4096 * 64); }
-    int16_t *sv = ss || cn ? NULL : sym_new(nctx, 1 << bits);
-    int pd = 0, pm = 0, psc = 0, pmn = 0;
-    for (uint64_t b = 0; b < nblocks; b++) {
-        uint8_t *B = data + b * bs;
-        int sc[8], mn[8], zb[8]; uint8_t q[256];
-        if (!dec) { k_unpack_scales(B + 4, sc, mn); k_unpack_vals(B, bits, q); }
-        uint16_t d, dm;
-        if (cn) { d = rd16(B); dm = rd16(B + 2); }
-        else if (sh) {
-            d  = code_f16s(c, dec, &fd, &pd, dec ? 0 : rd16(B));
-            dm = code_f16s(c, dec, &fm, &pm, dec ? 0 : rd16(B + 2));
-            for (int j = 0; j < 8; j++) {
-                sc[j] = csym(c, dec, ssc + psc * 64, 64, sc[j]); psc = sc[j];
-                mn[j] = csym(c, dec, smn + (size_t)(sc[j] * 64 + pmn) * 64, 64, mn[j]); pmn = mn[j];
-            }
-        } else {
-            d  = code_f16(c, dec, dhi, dlo, &pd, dec ? 0 : rd16(B));
-            dm = code_f16(c, dec, mhi, mlo, &pm, dec ? 0 : rd16(B + 2));
-            for (int j = 0; j < 8; j++) {
-                sc[j] = ctree(c, dec, msc + psc * 64, 6, sc[j]); psc = sc[j];
-                mn[j] = ctree(c, dec, mmn + (sc[j] * 64 + pmn) * 64, 6, mn[j]); pmn = mn[j];
-            }
-        }
-        float df = h2f(d), mf = h2f(dm);
-        for (int j = 0; j < 8; j++) {
-            float step = df * (float)sc[j];
-            float z = step > 0 ? mf * (float)mn[j] / step : 0.0f;
-            zb[j] = (z == z && z < 1e6f) ? clampi((int)rintf(z * 2.0f), 0, zmax) : 0;
-        }
-        for (int s = 0; s < 8; s++) {
-            int n0 = 0, nm = 0;
-            for (int i = 0; i < 32; i++) {
-                int idx = s * 32 + i;
-                size_t ctx = (size_t)(zb[s] * 9 + (n0 < 2 ? n0 : 2) * 3 + (nm < 2 ? nm : 2)) * 4 + (i >> 3);
-                if (!dec && c->cnt) c->cnt[(ctx << bits) + q[idx]]++;
-                int n = cn ? q[idx] : ss ? ssym(c, dec, c->stt + (ctx << bits), 1 << bits, q[idx])
-                                         : csym(c, dec, sv + (ctx << bits), 1 << bits, q[idx]);
-                q[idx] = (uint8_t)n; n0 += n == 0; nm += n == maxv;
-            }
-        }
-        if (dec) {
-            wr16(B, d); wr16(B + 2, dm); k_pack_scales(B + 4, sc, mn); k_pack_vals(B, bits, q);
-        }
-    }
-    free(dhi); free(dlo); free(mhi); free(mlo); free(msc); free(mmn); sym_free(sv);
-    if (sh) { f16s_free(&fd); f16s_free(&fm); sym_free(ssc); sym_free(smn); }
-}
-/* every setting is a constant in its own copy, so the symbol loops have a fixed length */
-#define KQ2(D, NB, SS, CN) (sh ? kq_code_impl(c, D, data, nblocks, NB, 1, SS, CN) : kq_code_impl(c, D, data, nblocks, NB, 0, SS, CN))
-#define KQ1(D, NB) do { if (!(D) && c->cnt_only) KQ2(0, NB, 0, 1); else if (c->stt) KQ2(D, NB, 1, 0); else KQ2(D, NB, 0, 0); } while (0)
-static void kq_code(Coder *c, uint8_t *data, uint64_t nblocks, int bits, int sh) {
-    if (c->dec) { if (bits == 4) KQ1(1, 4); else KQ1(1, 5); }
-    else        { if (bits == 4) KQ1(0, 4); else KQ1(0, 5); }
-}
-#undef KQ1
-#undef KQ2
 
 /* ---------------- Q6_K ---------------- */
 /* block: ql(128) qh(64) scales(16, int8) d(2); 16 sub-blocks of 16 */
@@ -565,10 +507,11 @@ HOT void q6k_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t rows, ui
             } else {
                 double dd = (double)h2f(d), D[16];
                 for (int k = 0; k < 16; k++) D[k] = dd * (double)(scs[k] - 128);   /* signed step, exact */
-                int nx = 0;
+                /* context bases first: they depend only on the rows above, so this loop never waits
+                   for the coder, and (with static tables) their rows can be fetched ahead */
+                int base[256];
                 for (int i = 0; i < 256; i++) {
                     int sb = i >> 4, pos = i & 15; uint64_t col = bb * 256 + i;
-                    if (pos == 0) nx = 0;
                     int offb = 12, widb = 7; double Ds = D[sb];
                     if (r > 0 && Ds != 0 && isfinite(Ds)) {
                         /* running mean and variance of the column (rows above), in units of Ds */
@@ -577,7 +520,21 @@ HOT void q6k_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t rows, ui
                         double var = SW2[col] / (double)r - m * m, r2 = var / (Ds * Ds);
                         widb = isfinite(r2) && r2 > 0 ? width_bucket(r2) : 0;
                     }
-                    int ctx = (offb * 8 + widb) * 48 + pos * 3 + (nx < 2 ? nx : 2);
+                    base[i] = (offb * 8 + widb) * 48 + pos * 3;
+#ifndef TENZ_NO_PREFETCH
+                    /* the rows this value may use (nx 0, 1, 2); build with -DTENZ_NO_PREFETCH to compare */
+                    if (ss && !cn) {
+                        const char *t0 = (const char *)(c->stt + (size_t)base[i] * 64);
+                        __builtin_prefetch(t0); __builtin_prefetch(t0 + 128); __builtin_prefetch(t0 + 256);
+                    }
+#endif
+                }
+                int nx = 0;
+                for (int i = 0; i < 256; i++) {
+                    int sb = i >> 4, pos = i & 15; uint64_t col = bb * 256 + i;
+                    if (pos == 0) nx = 0;
+                    double Ds = D[sb];
+                    int ctx = base[i] + (nx < 2 ? nx : 2);
                     if (!dec && c->cnt) c->cnt[(size_t)ctx * 64 + q[i]]++;
                     int v = cn ? q[i] : ss ? ssym(c, dec, c->stt + (size_t)ctx * 64, 64, q[i])
                                            : csym(c, dec, sv + (size_t)ctx * 64, 64, q[i]);
@@ -650,56 +607,444 @@ static void q80_code(Coder *c, uint8_t *data, uint64_t rows, uint64_t ne0) {
 }
 
 /* ---------------- F32, F16, BF16 ---------------- */
-/* Floats as 4-bit symbols from static tables. The high 16 bits (all of BF16 and F16; sign,
-   exponent and top mantissa bits of F32) are four nibbles a b c d, high first: a given the
-   previous value's a, b given a and the previous b, c given a b, d given c only: sign,
-   exponent and the top of the mantissa get the full context, the low mantissa bits (close to
-   random in trained weights) only a little, so their tables stay small. F32's low 16 bits
-   are close to random in trained weights (or all zero when converted from BF16), so each of
-   their nibbles only sees the one before it. Contexts: */
+/* Floats as 4-bit symbols from static tables, coded with rANS in FL_LANES interleaved lanes:
+   value i belongs to lane i % FL_LANES, and each lane carries its own state and its own history,
+   so the lanes are independent chains the CPU can work on at once. Decoding a symbol is a mask,
+   a table search, a multiply and an add: no division, unlike the range coder.
+   The high 16 bits (all of BF16 and F16; sign, exponent and top mantissa bits of F32) are four
+   nibbles a b c d, high first: a given the lane's previous a, b given a and the lane's previous
+   b, c given a b, d given c. F32's low 16 bits: each nibble given the one before. */
 #define FL_HI 544                                    /* 16 + 256 + 256 + 16 */
-#define FL_LO 64                                     /* F32 low half: each nibble given the one before */
-HOT int fl_nib(Coder *c, const int dec, const int ss, const int cn, size_t ctx, int v) {
-    if (cn) { c->cnt[ctx * 16 + v]++; return v; }
-    (void)ss;
-    return ssym(c, dec, c->stt + ctx * 16, 16, v);
+#define FL_LO 64
+#define FL_LANES 4
+#define RANS_L (1u << 16)                            /* rANS state in [2^16, 2^32), 16-bit output words */
+static inline int fl_nsym(uint32_t type) { return type == T_F32 ? 8 : 4; }
+static inline uint32_t fl_load(const uint8_t *data, uint64_t i, uint32_t type) {
+    if (type == T_F32) { uint32_t v; memcpy(&v, data + i * 4, 4); return v; }
+    return rd16(data + i * 2);
 }
-HOT uint32_t fl_half(Coder *c, const int dec, const int ss, const int cn, uint32_t h, int *pa, int *pb) {
-    int a = fl_nib(c, dec, ss, cn, (size_t)*pa, (int)(h >> 12) & 15);
-    int b = fl_nib(c, dec, ss, cn, 16 + (size_t)((a << 4) | *pb), (int)(h >> 8) & 15);
-    int cc = fl_nib(c, dec, ss, cn, 272 + (size_t)((a << 4) | b), (int)(h >> 4) & 15);
-    int d = fl_nib(c, dec, ss, cn, 528 + (size_t)cc, (int)h & 15);
-    *pa = a; *pb = b;
-    return (uint32_t)((a << 12) | (b << 8) | (cc << 4) | d);
+/* contexts and symbols of value v (its high half h; the low half for F32), lane history pa pb */
+static inline void fl_syms(uint32_t type, uint32_t v, int pa, int pb, int *ctx, int *sym) {
+    uint32_t h = type == T_F32 ? v >> 16 : v;
+    int a = (int)(h >> 12) & 15, b = (int)(h >> 8) & 15, c = (int)(h >> 4) & 15, d = (int)h & 15;
+    sym[0] = a; ctx[0] = pa;
+    sym[1] = b; ctx[1] = 16 + ((a << 4) | pb);
+    sym[2] = c; ctx[2] = 272 + ((a << 4) | b);
+    sym[3] = d; ctx[3] = 528 + c;
+    if (type == T_F32) {
+        int la = (int)(v >> 12) & 15, lb = (int)(v >> 8) & 15, lc = (int)(v >> 4) & 15, ld = (int)v & 15;
+        sym[4] = la; ctx[4] = FL_HI + d;
+        sym[5] = lb; ctx[5] = FL_HI + 16 + la;
+        sym[6] = lc; ctx[6] = FL_HI + 32 + lb;
+        sym[7] = ld; ctx[7] = FL_HI + 48 + lc;
+    }
 }
-HOT uint32_t fl_low(Coder *c, const int dec, const int ss, const int cn, uint32_t l, int dprev) {
-    const size_t B = FL_HI;
-    int a = fl_nib(c, dec, ss, cn, B + (size_t)dprev, (int)(l >> 12) & 15);
-    int b = fl_nib(c, dec, ss, cn, B + 16 + (size_t)a, (int)(l >> 8) & 15);
-    int cc = fl_nib(c, dec, ss, cn, B + 32 + (size_t)b, (int)(l >> 4) & 15);
-    int d = fl_nib(c, dec, ss, cn, B + 48 + (size_t)cc, (int)l & 15);
-    return (uint32_t)((a << 12) | (b << 8) | (cc << 4) | d);
-}
-HOT void float_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t n, uint32_t type, const int ss, const int cn) {
-    int pa = 0, pb = 0;
+/* pass 1: count */
+static void float_count(uint32_t *cnt, const uint8_t *data, uint64_t n, uint32_t type) {
+    int pa[FL_LANES] = {0}, pb[FL_LANES] = {0}, ctx[8], sym[8], ns = fl_nsym(type);
     for (uint64_t i = 0; i < n; i++) {
-        if (type == T_F32) {
-            uint8_t *p = data + i * 4; uint32_t v = 0;
-            if (!dec) memcpy(&v, p, 4);
-            uint32_t h = fl_half(c, dec, ss, cn, v >> 16, &pa, &pb);
-            uint32_t l = fl_low(c, dec, ss, cn, v & 0xFFFF, (int)(h & 15));
-            if (dec) { v = (h << 16) | l; memcpy(p, &v, 4); }
-        } else {
-            uint8_t *p = data + i * 2;
-            uint32_t h = fl_half(c, dec, ss, cn, dec ? 0 : rd16(p), &pa, &pb);
-            if (dec) wr16(p, (uint16_t)h);
+        int ln = (int)(i % FL_LANES);
+        fl_syms(type, fl_load(data, i, type), pa[ln], pb[ln], ctx, sym);
+        for (int k = 0; k < ns; k++) cnt[(size_t)ctx[k] * 16 + sym[k]]++;
+        pa[ln] = sym[0]; pb[ln] = sym[1];
+    }
+}
+/* encode: symbols in reverse order, words written backwards; out = lane states, then the words.
+   Returns the length, or 0 if it does not fit in cap. U: cumulative tables (sum SM). */
+static size_t float_encode(const uint8_t *data, uint64_t n, uint32_t type, const int16_t *U, uint8_t *out, size_t cap) {
+    size_t head = 4 * FL_LANES;
+    if (cap < head + 2) return 0;
+    size_t nw = (cap - head) / 2; uint16_t *w = xmalloc(nw * 2 + 2), *wp = w + nw;
+    uint32_t x[FL_LANES]; int ctx[8], sym[8], ns = fl_nsym(type);
+    for (int k = 0; k < FL_LANES; k++) x[k] = RANS_L;
+    for (uint64_t i = n; i-- > 0;) {
+        int ln = (int)(i % FL_LANES), pa = 0, pb = 0;
+        if (i >= FL_LANES) { int c2[8], s2[8]; fl_syms(type, fl_load(data, i - FL_LANES, type), 0, 0, c2, s2); pa = s2[0]; pb = s2[1]; }
+        fl_syms(type, fl_load(data, i, type), pa, pb, ctx, sym);
+        uint32_t st = x[ln];
+        for (int k = ns - 1; k >= 0; k--) {
+            const int16_t *T = U + (size_t)ctx[k] * 16;
+            uint32_t start = sym[k] ? (uint32_t)T[sym[k] - 1] : 0, f = (uint32_t)T[sym[k]] - start;
+            if (!f) die("internal: float symbol without frequency");
+            if ((uint64_t)st >= ((uint64_t)(RANS_L >> SM_BITS) << 16) * f) {   /* 64-bit: f = SM gives 2^32 */ if (wp == w) { free(w); return 0; } *--wp = (uint16_t)st; st >>= 16; }
+            st = ((st / f) << SM_BITS) + (st % f) + start;
+        }
+        x[ln] = st;
+    }
+    size_t words = (size_t)(w + nw - wp);
+    for (int k = 0; k < FL_LANES; k++) memcpy(out + 4 * k, &x[k], 4);
+    memcpy(out + head, wp, words * 2);
+    free(w);
+    return head + words * 2;
+}
+static inline int fl_search(const int16_t *T, uint32_t slot) {    /* number of cumulative counts <= slot */
+#ifdef SYM_VEC
+    V8 vv = IOTA8 * 0 + (int16_t)slot, acc = IOTA8 * 0, u0, u1;
+    memcpy(&u0, T, 16); memcpy(&u1, T + 8, 16); acc -= (V8)(u0 <= vv); acc -= (V8)(u1 <= vv);
+    uint64_t a2[2]; memcpy(a2, &acc, 16);
+    return (int)(((a2[0] + a2[1]) * 0x0001000100010001ull) >> 48);
+#else
+    int sy = 0; for (int i = 0; i < 16; i++) sy += T[i] <= (int16_t)slot; return sy;
+#endif
+}
+/* decode; corrupt input gives wrong values, never reads outside in[0..len) */
+HOT void float_decode(const uint8_t *in, size_t len, uint64_t n, uint32_t type, const int16_t *U, uint8_t *data) {
+    size_t head = 4 * FL_LANES;
+    if (len < head) die("corrupt file");
+    uint32_t x[FL_LANES]; int pa[FL_LANES] = {0}, pb[FL_LANES] = {0};
+    for (int k = 0; k < FL_LANES; k++) memcpy(&x[k], in + 4 * k, 4);
+    const uint8_t *p = in + head, *end = in + len;
+    #define FL_DSYM(CTX, OUT) do {                                                              \
+        const int16_t *T = U + (size_t)(CTX) * 16; uint32_t slot = st & (SM - 1);                \
+        int sy = fl_search(T, slot);                                                            \
+        uint32_t s0 = sy ? (uint32_t)T[sy - 1] : 0, f = (uint32_t)T[sy] - s0;                  \
+        st = f * (st >> SM_BITS) + slot - s0;                                                     \
+        if (st < RANS_L && p + 2 <= end) { uint16_t w16; memcpy(&w16, p, 2); p += 2; st = (st << 16) | w16; } \
+        (OUT) = sy; } while (0)
+    /* one value of lane L: its state and history in locals, so the 4 lanes are independent chains */
+    #define FL_DVAL(L, I) do {                                                                  \
+        uint32_t st = st##L; int a, b, cc, d;                                                   \
+        FL_DSYM(pa##L, a); FL_DSYM(16 + ((a << 4) | pb##L), b);                                 \
+        FL_DSYM(272 + ((a << 4) | b), cc); FL_DSYM(528 + cc, d);                                \
+        uint32_t h = (uint32_t)((a << 12) | (b << 8) | (cc << 4) | d); pa##L = a; pb##L = b;   \
+        if (type == T_F32) {                                                                    \
+            int la, lb, lc, ld;                                                                 \
+            FL_DSYM(FL_HI + d, la); FL_DSYM(FL_HI + 16 + la, lb); FL_DSYM(FL_HI + 32 + lb, lc); FL_DSYM(FL_HI + 48 + lc, ld); \
+            uint32_t v = (h << 16) | (uint32_t)((la << 12) | (lb << 8) | (lc << 4) | ld);        \
+            memcpy(data + (I) * 4, &v, 4);                                                      \
+        } else wr16(data + (I) * 2, (uint16_t)h);                                               \
+        st##L = st; } while (0)
+    uint32_t st0 = x[0], st1 = x[1], st2 = x[2], st3 = x[3];
+    int pa0 = 0, pa1 = 0, pa2 = 0, pa3 = 0, pb0 = 0, pb1 = 0, pb2 = 0, pb3 = 0;
+    (void)pa; (void)pb;
+    uint64_t i = 0;
+    for (; i + 4 <= n; i += 4) { FL_DVAL(0, i); FL_DVAL(1, i + 1); FL_DVAL(2, i + 2); FL_DVAL(3, i + 3); }
+    if (i < n) { FL_DVAL(0, i); i++; }
+    if (i < n) { FL_DVAL(1, i); i++; }
+    if (i < n) { FL_DVAL(2, i); i++; }
+    #undef FL_DVAL
+    #undef FL_DSYM
+}
+static void float_code(Coder *c, uint8_t *data, uint64_t n, uint32_t type) {
+    if (!c->dec && c->cnt_only) float_count(c->cnt, data, n, type);
+    else die("internal: floats are coded with float_encode / float_decode");
+}
+
+/* ---------------- Q4_K and Q5_K in rANS lanes ---------------- */
+/* Whole blocks are coded with rANS in 4 interleaved lanes from static tables, like the floats;
+   only the components differ. One stream, 4 states, in groups of 4 blocks:
+   - headers: block b belongs to lane b % 4, and each lane has its own history (the lane's
+     previous block), so the 4 headers of a group are 4 independent chains of 40 symbols:
+       d, dmin   fp16 as four nibbles a b c d, high first: a given the lane's previous a, b given
+                 a and the lane's previous b, c given a b, d given c (as the floats)
+       scale     6 bits as high 2 + low 4: high given the previous scale, low given both
+       min       6 bits as high 2 + low 4: high given its scale and the previous min, low given
+                 the high part, the previous min and the scale (coarser)
+     ("previous" scale and min: the sub-block before; for the first, the lane's previous block)
+   - values: contexts are the zero point of the sub-block, 0 and max seen so far in it, and the
+     position. They restart at every 32-value sub-block, so lane L takes sub-blocks L and 4 + L
+     of a block: value i of 4 sub-blocks at once.
+   Table rows: the value contexts first, then KH_CTX header contexts (16 symbols used). */
+enum { KH_D = 0, KH_M = FL_HI, KH_SH = 2 * FL_HI, KH_SL = KH_SH + 64, KH_MH = KH_SL + 256, KH_ML = KH_MH + 1024,
+       KH_CTX = KH_ML + 512, KH_N = 40 };
+static inline int kq_vctx(int bits) { return (bits == 4 ? 32 : 64) * 36; }
+static inline int kq_search(const int16_t *T, int k, uint32_t slot) {   /* number of cumulative counts <= slot */
+#ifdef SYM_VEC
+    V8 vv = IOTA8 * 0 + (int16_t)slot, acc = IOTA8 * 0;
+    for (int o = 0; o < k; o += 8) { V8 u; memcpy(&u, T + o, 16); acc -= (V8)(u <= vv); }
+    uint64_t a2[2]; memcpy(a2, &acc, 16);
+    return (int)(((a2[0] + a2[1]) * 0x0001000100010001ull) >> 48);
+#else
+    int sy = 0; for (int i = 0; i < k; i++) sy += T[i] <= (int16_t)slot; return sy;
+#endif
+}
+static void kq_zb(const uint8_t *B, int bits, int *zb) {             /* the sub-blocks' zero points */
+    int sc[8], mn[8], zmax = bits == 4 ? 31 : 63; k_unpack_scales(B + 4, sc, mn);
+    float df = h2f(rd16(B)), mf = h2f(rd16(B + 2));
+    for (int j = 0; j < 8; j++) {
+        float step = df * (float)sc[j];
+        float z = step > 0 ? mf * (float)mn[j] / step : 0.0f;
+        zb[j] = (z == z && z < 1e6f) ? clampi((int)rintf(z * 2.0f), 0, zmax) : 0;
+    }
+}
+/* contexts of a block's 256 values, in block order (q: the unpacked values) */
+static void kq_val_ctx(const uint8_t *B, int bits, const uint8_t *q, uint16_t *ctx) {
+    int zb[8], maxv = (1 << bits) - 1; kq_zb(B, bits, zb);
+    for (int s = 0; s < 8; s++) {
+        int n0 = 0, nm = 0;
+        for (int i = 0; i < 32; i++) {
+            int idx = s * 32 + i;
+            ctx[idx] = (uint16_t)((zb[s] * 9 + (n0 < 2 ? n0 : 2) * 3 + (nm < 2 ? nm : 2)) * 4 + (i >> 3));
+            n0 += q[idx] == 0; nm += q[idx] == maxv;
         }
     }
 }
-static void float_code(Coder *c, uint8_t *data, uint64_t n, uint32_t type) {
-    if (c->dec) { if (!c->stt) die("corrupt file"); float_code_impl(c, 1, data, n, type, 1, 0); }
-    else if (c->cnt_only) float_code_impl(c, 0, data, n, type, 0, 1);
-    else { if (!c->stt) die("internal: float segment without tables"); float_code_impl(c, 0, data, n, type, 1, 0); }
+static inline void kq_f16_syms(uint16_t h, uint16_t ph, int base, uint16_t *ctx, uint8_t *sym) {
+    int a = h >> 12, b = (h >> 8) & 15, c = (h >> 4) & 15, d = h & 15, pa = ph >> 12, pb = (ph >> 8) & 15;
+    sym[0] = (uint8_t)a; ctx[0] = (uint16_t)(base + pa);
+    sym[1] = (uint8_t)b; ctx[1] = (uint16_t)(base + 16 + ((a << 4) | pb));
+    sym[2] = (uint8_t)c; ctx[2] = (uint16_t)(base + 272 + ((a << 4) | b));
+    sym[3] = (uint8_t)d; ctx[3] = (uint16_t)(base + 528 + c);
+}
+/* the KH_N header symbols of block B and their contexts (0 .. KH_CTX-1), in coding order;
+   P: the lane's previous block (4 blocks back), or NULL */
+static void kq_hdr_syms(const uint8_t *B, const uint8_t *P, uint16_t *ctx, uint8_t *sym) {
+    int sc[8], mn[8], psc = 0, pmn = 0;
+    k_unpack_scales(B + 4, sc, mn);
+    if (P) { int s2[8], m2[8]; k_unpack_scales(P + 4, s2, m2); psc = s2[7]; pmn = m2[7]; }
+    kq_f16_syms(rd16(B), P ? rd16(P) : 0, KH_D, ctx, sym);
+    kq_f16_syms(rd16(B + 2), P ? rd16(P + 2) : 0, KH_M, ctx + 4, sym + 4);
+    for (int j = 0; j < 8; j++) {
+        int o = 8 + 4 * j, sh = sc[j] >> 4, mh = mn[j] >> 4;
+        sym[o]     = (uint8_t)sh;            ctx[o]     = (uint16_t)(KH_SH + psc);
+        sym[o + 1] = (uint8_t)(sc[j] & 15);  ctx[o + 1] = (uint16_t)(KH_SL + psc * 4 + sh);
+        sym[o + 2] = (uint8_t)mh;            ctx[o + 2] = (uint16_t)(KH_MH + sc[j] * 16 + (pmn >> 2));
+        sym[o + 3] = (uint8_t)(mn[j] & 15);  ctx[o + 3] = (uint16_t)(KH_ML + (mh * 16 + (pmn >> 2)) * 8 + (sc[j] >> 3));
+        psc = sc[j]; pmn = mn[j];
+    }
+}
+/* pass 1: count */
+static void kq_count(uint32_t *cnt, const uint8_t *data, uint64_t nblocks, int bits) {
+    int bs = bits == 4 ? 144 : 176, hb = kq_vctx(bits);
+    for (uint64_t b = 0; b < nblocks; b++) {
+        const uint8_t *B = data + b * bs; uint8_t q[256], hs[KH_N]; uint16_t ctx[256], hc[KH_N];
+        kq_hdr_syms(B, b >= 4 ? B - 4 * bs : NULL, hc, hs);
+        for (int n = 0; n < KH_N; n++) cnt[((size_t)(hb + hc[n]) << bits) + hs[n]]++;
+        k_unpack_vals(B, bits, q); kq_val_ctx(B, bits, q, ctx);
+        for (int i = 0; i < 256; i++) cnt[((size_t)ctx[i] << bits) + q[i]]++;
+    }
+}
+/* one rANS encoder step: symbol sy of table row T into state *x; 0 if the word buffer is full */
+static inline int rans_put(uint32_t *x, const int16_t *T, int sy, uint16_t **wp, const uint16_t *w) {
+    uint32_t start = sy ? (uint32_t)T[sy - 1] : 0, f = (uint32_t)T[sy] - start, st = *x;
+    if (!f) die("internal: K-quant symbol without frequency");
+    if ((uint64_t)st >= ((uint64_t)(RANS_L >> SM_BITS) << 16) * f) { if (*wp == w) return 0; *--*wp = (uint16_t)st; st >>= 16; }
+    *x = ((st / f) << SM_BITS) + (st % f) + start;
+    return 1;
+}
+/* encode: everything in the reverse of the decoder's order, words written backwards;
+   out = 4 lane states, then the words. Returns the length, or 0 if it does not fit in cap. */
+static size_t kq_lanes_encode(const uint8_t *data, uint64_t nblocks, int bits, const int16_t *U, uint8_t *out, size_t cap) {
+    int bs = bits == 4 ? 144 : 176, k = 1 << bits, hb = kq_vctx(bits); size_t head = 16;
+    if (cap < head + 2) return 0;
+    size_t nw = (cap - head) / 2; uint16_t *w = xmalloc(nw * 2 + 2), *wp = w + nw;
+    uint32_t x[4] = {RANS_L, RANS_L, RANS_L, RANS_L};
+    for (uint64_t g = (nblocks + 3) / 4; g-- > 0;) {
+        uint64_t b0 = g * 4; int nb = nblocks - b0 < 4 ? (int)(nblocks - b0) : 4;
+        for (int bi = nb - 1; bi >= 0; bi--) {             /* values, last block of the group first */
+            const uint8_t *B = data + (b0 + bi) * bs; uint8_t q[256]; uint16_t ctx[256];
+            k_unpack_vals(B, bits, q); kq_val_ctx(B, bits, q, ctx);
+            for (int h = 1; h >= 0; h--) for (int i = 31; i >= 0; i--) for (int L = 3; L >= 0; L--) {
+                int idx = (4 * h + L) * 32 + i;
+                if (!rans_put(&x[L], U + (size_t)ctx[idx] * k, q[idx], &wp, w)) { free(w); return 0; }
+            }
+        }
+        uint16_t hc[4][KH_N]; uint8_t hs[4][KH_N];        /* headers: symbol n of each block, lane = block */
+        for (int L = 0; L < nb; L++) { const uint8_t *B = data + (b0 + L) * bs; kq_hdr_syms(B, b0 ? B - 4 * bs : NULL, hc[L], hs[L]); }
+        for (int n = KH_N - 1; n >= 0; n--) for (int L = nb - 1; L >= 0; L--)
+            if (!rans_put(&x[L], U + (size_t)(hb + hc[L][n]) * k, hs[L][n], &wp, w)) { free(w); return 0; }
+    }
+    size_t words = (size_t)(w + nw - wp);
+    for (int L = 0; L < 4; L++) memcpy(out + 4 * L, &x[L], 4);
+    memcpy(out + head, wp, words * 2); free(w);
+    return head + words * 2;
+}
+/* decode; corrupt input gives wrong values, never reads outside in[0..len) or the tables */
+HOT void kq_lanes_decode_impl(const uint8_t *in, size_t len, uint8_t *data, uint64_t nblocks, const int bits, const int16_t *U) {
+    const int bs = bits == 4 ? 144 : 176, k = 1 << bits, maxv = k - 1, zmax = bits == 4 ? 31 : 63;
+    const int16_t *UH = U + (size_t)kq_vctx(bits) * k;        /* header rows */
+    if (len < 16) die("corrupt file");
+    uint32_t x[4]; for (int L = 0; L < 4; L++) memcpy(&x[L], in + 4 * L, 4);
+    const uint8_t *p = in + 16, *end = in + len;
+    /* one symbol of lane L from row T (KK counts searched) */
+    #define KQ_GET(L, ROW, KK, OUT) do {                                                         \
+        const int16_t *T_ = (ROW); uint32_t st_ = x[L], slot_ = st_ & (SM - 1); int sy_ = kq_search(T_, KK, slot_); \
+        uint32_t s0_ = sy_ ? (uint32_t)T_[sy_ - 1] : 0, f_ = (uint32_t)T_[sy_] - s0_;            \
+        st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                               \
+        if (st_ < RANS_L && p + 2 <= end) { uint16_t w16; memcpy(&w16, p, 2); p += 2; st_ = (st_ << 16) | w16; } \
+        x[L] = st_; (OUT) = sy_; } while (0)
+    /* a header symbol: 16 counts searched; a corrupt table could give 16, so mask */
+    #define KQ_HDR(L, CTX, MASK, OUT) do { int s_; KQ_GET(L, UH + (size_t)(CTX) * k, 16, s_); (OUT) = s_ & (MASK); } while (0)
+    /* fp16 of the group's blocks: nibble by nibble across the lanes */
+    #define KQ_F16(BASE, PA, PB, OUT) do { int a[4] = {0}, b_[4] = {0}, c_[4] = {0}, d_[4] = {0};  \
+        for (int L = 0; L < nb; L++) KQ_HDR(L, (BASE) + PA[L], 15, a[L]);                        \
+        for (int L = 0; L < nb; L++) KQ_HDR(L, (BASE) + 16 + ((a[L] << 4) | PB[L]), 15, b_[L]);  \
+        for (int L = 0; L < nb; L++) KQ_HDR(L, (BASE) + 272 + ((a[L] << 4) | b_[L]), 15, c_[L]); \
+        for (int L = 0; L < nb; L++) KQ_HDR(L, (BASE) + 528 + c_[L], 15, d_[L]);                 \
+        for (int L = 0; L < nb; L++) { OUT[L] = (uint16_t)((a[L] << 12) | (b_[L] << 8) | (c_[L] << 4) | d_[L]); PA[L] = a[L]; PB[L] = b_[L]; } \
+        } while (0)
+    int da[4] = {0}, db[4] = {0}, ma[4] = {0}, mb[4] = {0}, psc[4] = {0}, pmn[4] = {0};
+    for (uint64_t b0 = 0; b0 < nblocks; b0 += 4) {
+        const int nb = nblocks - b0 < 4 ? (int)(nblocks - b0) : 4;
+        uint16_t d[4], dm[4]; int sc[4][8], mn[4][8];
+        KQ_F16(KH_D, da, db, d); KQ_F16(KH_M, ma, mb, dm);
+        for (int j = 0; j < 8; j++) {
+            int sh[4] = {0}, sl[4] = {0}, mh[4] = {0}, ml[4] = {0};
+            for (int L = 0; L < nb; L++) KQ_HDR(L, KH_SH + psc[L], 3, sh[L]);
+            for (int L = 0; L < nb; L++) { KQ_HDR(L, KH_SL + psc[L] * 4 + sh[L], 15, sl[L]); sc[L][j] = (sh[L] << 4) | sl[L]; }
+            for (int L = 0; L < nb; L++) KQ_HDR(L, KH_MH + sc[L][j] * 16 + (pmn[L] >> 2), 3, mh[L]);
+            for (int L = 0; L < nb; L++) { KQ_HDR(L, KH_ML + (mh[L] * 16 + (pmn[L] >> 2)) * 8 + (sc[L][j] >> 3), 15, ml[L]);
+                                           mn[L][j] = (mh[L] << 4) | ml[L]; psc[L] = sc[L][j]; pmn[L] = mn[L][j]; }
+        }
+        for (int bi = 0; bi < nb; bi++) {
+            uint8_t *B = data + (b0 + bi) * bs; uint8_t q[256]; int zb[8];
+            wr16(B, d[bi]); wr16(B + 2, dm[bi]); k_pack_scales(B + 4, sc[bi], mn[bi]);
+            float df = h2f(d[bi]), mf = h2f(dm[bi]);
+            for (int j = 0; j < 8; j++) {                     /* as kq_zb */
+                float step = df * (float)sc[bi][j];
+                float z = step > 0 ? mf * (float)mn[bi][j] / step : 0.0f;
+                zb[j] = (z == z && z < 1e6f) ? clampi((int)rintf(z * 2.0f), 0, zmax) : 0;
+            }
+            for (int h = 0; h < 2; h++) {
+                int n0[4] = {0}, nm[4] = {0};
+                for (int i = 0; i < 32; i++) for (int L = 0; L < 4; L++) {
+                    int s = 4 * h + L, idx = s * 32 + i, sy;
+                    KQ_GET(L, U + (size_t)((zb[s] * 9 + (n0[L] < 2 ? n0[L] : 2) * 3 + (nm[L] < 2 ? nm[L] : 2)) * 4 + (i >> 3)) * k, k, sy);
+                    q[idx] = (uint8_t)sy; n0[L] += sy == 0; nm[L] += sy == maxv;
+                }
+            }
+            k_pack_vals(B, bits, q);
+        }
+    }
+    #undef KQ_F16
+    #undef KQ_HDR
+    #undef KQ_GET
+}
+static void kq_lanes_decode(const uint8_t *in, size_t len, uint8_t *data, uint64_t nblocks, int bits, const int16_t *U) {
+    if (bits == 4) kq_lanes_decode_impl(in, len, data, nblocks, 4, U); else kq_lanes_decode_impl(in, len, data, nblocks, 5, U);
+}
+static void kq_code(Coder *c, uint8_t *data, uint64_t nblocks, int bits) {
+    if (!c->dec && c->cnt_only) kq_count(c->cnt, data, nblocks, bits);
+    else die("internal: Q4_K and Q5_K are coded with kq_lanes_encode / kq_lanes_decode");
+}
+
+/* ---------------- Q4_0 in rANS lanes ---------------- */
+/* block: d(2) + 16 bytes, value i in the low nibble of byte i and value 16 + i in the high one;
+   w = d * (q - 8), and the quantizer maps the block's largest |w| to q = 0.
+   Blocks in groups of 4, block b in lane b % 4 (like the Q4_K headers), one rANS stream:
+   - d: fp16 as four nibbles with the float contexts, the lane's previous d as history
+   - values: the column's share of positive weights so far (as Q8_0; flipped when d < 0), whether
+     q = 0 was seen in the block, the average |q - 8| so far, the position. The column counts are
+     those at the start of the group and are updated after it, so the 4 lanes stay independent.
+   Table rows: Q40_VCTX value contexts, then FL_HI header contexts. */
+#define Q40_VCTX (8 * 2 * 8 * 4)
+static const uint32_t Q40_INV[33] = {0, 65536, 32768, 21845, 16384, 13107, 10922, 9362, 8192, 7281, 6553,
+    5957, 5461, 5041, 4681, 4369, 4096, 3855, 3640, 3449, 3276, 3120, 2978, 2849, 2730, 2621, 2520, 2427,
+    2340, 2259, 2184, 2114, 2048};
+/* share_bucket(P, r) as 7 thresholds on P, fixed per row: 100 (P + 1) >= E (r + 2) <=> P >= th */
+static inline void q40_th(uint64_t r, uint32_t *th) {
+    static const uint64_t E[7] = {30, 40, 45, 50, 55, 60, 70};
+    for (int k = 0; k < 7; k++) { uint64_t t = (E[k] * (r + 2) + 99) / 100; th[k] = (uint32_t)(t ? t - 1 : 0); }
+}
+static inline int q40_ctx1(const uint32_t *P, uint64_t col, const uint32_t *th, int ds, int seen, int sa, int i) {
+    uint32_t pc = P[col]; int cb = 0;
+    for (int k = 0; k < 7; k++) cb += pc >= th[k];
+    if (ds < 0) cb = 7 - cb;
+    int av = (int)((2u * (uint32_t)sa * Q40_INV[i]) >> 16); if (av > 7) av = 7;
+    return ((cb * 2 + seen) * 8 + av) * 4 + (i >> 3);
+}
+static inline void q40_unpack(const uint8_t *B, uint8_t *q) { for (int j = 0; j < 16; j++) { q[j] = B[2 + j] & 15; q[16 + j] = B[2 + j] >> 4; } }
+/* block b's value contexts, from the column counts P */
+static void q40_vctx(const uint32_t *P, uint64_t b, uint64_t bpr, const uint8_t *q, int ds, uint16_t *ctx) {
+    uint64_t c0 = b % bpr * 32; int seen = 0, sa = 0; uint32_t th[7]; q40_th(b / bpr, th);
+    for (int i = 0; i < 32; i++) {
+        ctx[i] = (uint16_t)q40_ctx1(P, c0 + i, th, ds, seen, sa, i);
+        seen |= q[i] == 0; sa += q[i] < 8 ? 8 - q[i] : q[i] - 8;
+    }
+}
+/* add (dir 1) or remove (dir -1) block b's values in the column counts */
+static inline void q40_cols(uint32_t *P, uint64_t b, uint64_t bpr, const uint8_t *q, int ds, int dir) {
+    uint32_t *Pc = P + b % bpr * 32;
+    for (int i = 0; i < 32; i++) Pc[i] += (uint32_t)(dir * (((int)q[i] - 8) * ds > 0));
+}
+static void q40_count(uint32_t *cnt, const uint8_t *data, uint64_t rows, uint64_t ne0) {
+    uint64_t bpr = ne0 / 32, nb = rows * bpr; uint32_t *P = calloc(ne0, 4); if (!P) die("out of memory");
+    for (uint64_t b0 = 0; b0 < nb; b0 += 4) {
+        int n = nb - b0 < 4 ? (int)(nb - b0) : 4; uint8_t q[4][32];
+        for (int L = 0; L < n; L++) {
+            uint64_t b = b0 + L; const uint8_t *B = data + b * 18; uint16_t hc[4], ctx[32]; uint8_t hs[4];
+            kq_f16_syms(rd16(B), b >= 4 ? rd16(B - 72) : 0, Q40_VCTX, hc, hs);
+            for (int k = 0; k < 4; k++) cnt[((size_t)hc[k] << 4) + hs[k]]++;
+            q40_unpack(B, q[L]); q40_vctx(P, b, bpr, q[L], sgn16(rd16(B)), ctx);
+            for (int i = 0; i < 32; i++) cnt[((size_t)ctx[i] << 4) + q[L][i]]++;
+        }
+        for (int L = 0; L < n; L++) q40_cols(P, b0 + L, bpr, q[L], sgn16(rd16(data + (b0 + L) * 18)), 1);
+    }
+    free(P);
+}
+/* encode: everything in the reverse of the decoder's order, words written backwards. The column
+   counts are run to the end first, then taken back group by group. 0 if it does not fit in cap. */
+static size_t q40_encode(const uint8_t *data, uint64_t rows, uint64_t ne0, const int16_t *U, uint8_t *out, size_t cap) {
+    size_t head = 16;
+    if (cap < head + 2) return 0;
+    uint64_t bpr = ne0 / 32, nb = rows * bpr; uint32_t *P = calloc(ne0, 4); if (!P) die("out of memory");
+    for (uint64_t b = 0; b < nb; b++) { uint8_t q[32]; q40_unpack(data + b * 18, q); q40_cols(P, b, bpr, q, sgn16(rd16(data + b * 18)), 1); }
+    size_t nw = (cap - head) / 2; uint16_t *w = xmalloc(nw * 2 + 2), *wp = w + nw;
+    uint32_t x[4] = {RANS_L, RANS_L, RANS_L, RANS_L};
+    for (uint64_t g = (nb + 3) / 4; g-- > 0;) {
+        uint64_t b0 = g * 4; int n = nb - b0 < 4 ? (int)(nb - b0) : 4;
+        uint8_t q[4][32], hs[4][4]; uint16_t ctx[4][32], hc[4][4]; int ds[4];
+        for (int L = 0; L < n; L++) { const uint8_t *B = data + (b0 + L) * 18; q40_unpack(B, q[L]); ds[L] = sgn16(rd16(B)); q40_cols(P, b0 + L, bpr, q[L], ds[L], -1); }
+        for (int L = 0; L < n; L++) {
+            const uint8_t *B = data + (b0 + L) * 18;
+            q40_vctx(P, b0 + L, bpr, q[L], ds[L], ctx[L]);
+            kq_f16_syms(rd16(B), b0 ? rd16(B - 72) : 0, Q40_VCTX, hc[L], hs[L]);
+        }
+        for (int i = 31; i >= 0; i--) for (int L = n - 1; L >= 0; L--)
+            if (!rans_put(&x[L], U + (size_t)ctx[L][i] * 16, q[L][i], &wp, w)) { free(w); free(P); return 0; }
+        for (int k = 3; k >= 0; k--) for (int L = n - 1; L >= 0; L--)
+            if (!rans_put(&x[L], U + (size_t)hc[L][k] * 16, hs[L][k], &wp, w)) { free(w); free(P); return 0; }
+    }
+    size_t words = (size_t)(w + nw - wp);
+    for (int L = 0; L < 4; L++) memcpy(out + 4 * L, &x[L], 4);
+    memcpy(out + head, wp, words * 2); free(w); free(P);
+    return head + words * 2;
+}
+typedef struct { uint32_t x[4]; const uint8_t *p, *end; } RansDec;
+#define RD_GET(D, L, ROW, OUT) do {                                                                  \
+    const int16_t *T_ = (ROW); uint32_t st_ = (D)->x[L], slot_ = st_ & (SM - 1); int sy_ = kq_search(T_, 16, slot_); \
+    uint32_t s0_ = sy_ ? (uint32_t)T_[sy_ - 1] : 0, f_ = (uint32_t)T_[sy_] - s0_;                    \
+    st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                                       \
+    if (st_ < RANS_L && (D)->p + 2 <= (D)->end) { uint16_t w16; memcpy(&w16, (D)->p, 2); (D)->p += 2; st_ = (st_ << 16) | w16; } \
+    (D)->x[L] = st_; (OUT) = sy_; } while (0)
+/* one group of n blocks (n = 4 except at the end; inlined for each) */
+static inline __attribute__((always_inline)) void q40_dgroup(RansDec *D, uint8_t *data, uint64_t b0, const int n, uint64_t bpr,
+                                                             uint32_t *P, const int16_t *U, int *pa, int *pb) {
+    const int16_t *UH = U + (size_t)Q40_VCTX * 16;
+    int a[4] = {0}, bn[4] = {0}, cn[4] = {0}, dn[4] = {0}, ds[4], seen[4] = {0}, sa[4] = {0};
+    uint64_t c0[4]; uint32_t th[4][7]; uint8_t q[4][32]; uint16_t d[4];
+    for (int L = 0; L < n; L++) RD_GET(D, L, UH + (size_t)pa[L] * 16, a[L]);
+    for (int L = 0; L < n; L++) RD_GET(D, L, UH + (size_t)(16 + ((a[L] << 4) | pb[L])) * 16, bn[L]);
+    for (int L = 0; L < n; L++) RD_GET(D, L, UH + (size_t)(272 + ((a[L] << 4) | bn[L])) * 16, cn[L]);
+    for (int L = 0; L < n; L++) RD_GET(D, L, UH + (size_t)(528 + cn[L]) * 16, dn[L]);
+    for (int L = 0; L < n; L++) {
+        d[L] = (uint16_t)((a[L] << 12) | (bn[L] << 8) | (cn[L] << 4) | dn[L]); pa[L] = a[L]; pb[L] = bn[L];
+        ds[L] = sgn16(d[L]); q40_th((b0 + L) / bpr, th[L]); c0[L] = (b0 + L) % bpr * 32;
+    }
+    for (int i = 0; i < 32; i++) for (int L = 0; L < n; L++) {
+        int sy; RD_GET(D, L, U + (size_t)q40_ctx1(P, c0[L] + i, th[L], ds[L], seen[L], sa[L], i) * 16, sy);
+        q[L][i] = (uint8_t)sy; seen[L] |= sy == 0; sa[L] += sy < 8 ? 8 - sy : sy - 8;
+    }
+    for (int L = 0; L < n; L++) {
+        uint8_t *B = data + (b0 + L) * 18; wr16(B, d[L]);
+        for (int j = 0; j < 16; j++) B[2 + j] = (uint8_t)(q[L][j] | (q[L][16 + j] << 4));
+        q40_cols(P, b0 + L, bpr, q[L], ds[L], 1);
+    }
+}
+/* decode; corrupt input gives wrong values, never reads outside in[0..len) */
+HOT void q40_decode(const uint8_t *in, size_t len, uint8_t *data, uint64_t rows, uint64_t ne0, const int16_t *U) {
+    if (len < 16) die("corrupt file");
+    RansDec D; for (int L = 0; L < 4; L++) memcpy(&D.x[L], in + 4 * L, 4);
+    D.p = in + 16; D.end = in + len;
+    uint64_t bpr = ne0 / 32, nb = rows * bpr, b0 = 0; uint32_t *P = calloc(ne0, 4); if (!P) die("out of memory");
+    int pa[4] = {0}, pb[4] = {0};
+    for (; b0 + 4 <= nb; b0 += 4) q40_dgroup(&D, data, b0, 4, bpr, P, U, pa, pb);
+    if (b0 < nb) q40_dgroup(&D, data, b0, (int)(nb - b0), bpr, P, U, pa, pb);
+    free(P);
+}
+static void q40_code(Coder *c, uint8_t *data, uint64_t rows, uint64_t ne0) {
+    if (!c->dec && c->cnt_only) q40_count(c->cnt, data, rows, ne0);
+    else die("internal: Q4_0 is coded with q40_encode / q40_decode");
 }
 
 /* ---------------- other bytes: context mixing ---------------- */
@@ -812,10 +1157,11 @@ static uint64_t seg_bytes(const Seg *s) {                 /* untrusted on decomp
 }
 static void code_seg(Coder *c, Seg *s, uint8_t *p) {
     switch (s->type) {
-        case T_Q4K: kq_code(c, p, s->size / 144, 4, (s->model & H_SYM) != 0); break;
-        case T_Q5K: kq_code(c, p, s->size / 176, 5, (s->model & H_SYM) != 0); break;
+        case T_Q4K: kq_code(c, p, s->size / 144, 4); break;
+        case T_Q5K: kq_code(c, p, s->size / 176, 5); break;
         case T_Q6K: q6k_code(c, p, s->rows, s->ne0, (s->model & 255) == M_LATTICE, (s->model & H_SYM) != 0); break;
         case T_Q8_0: q80_code(c, p, s->rows, s->ne0); break;
+        case T_Q4_0: q40_code(c, p, s->rows, s->ne0); break;
         case T_BYTES: bytes_code(c, p, s->size); break;
         default: float_code(c, p, s->rows * s->ne0, s->type);
     }
@@ -823,15 +1169,19 @@ static void code_seg(Coder *c, Seg *s, uint8_t *p) {
 
 /* ---------------- static value tables ---------------- */
 /* types with static value tables (K-quants and Q8_0): index, symbols per context, contexts */
-#define NSTATIC 7
+#define NSTATIC 8
 static int kq_index(uint32_t type) {
     return type == T_Q4K ? 0 : type == T_Q5K ? 1 : type == T_Q6K ? 2 : type == T_Q8_0 ? 3 :
-           type == T_BF16 ? 4 : type == T_F16 ? 5 : type == T_F32 ? 6 : -1;
+           type == T_BF16 ? 4 : type == T_F16 ? 5 : type == T_F32 ? 6 : type == T_Q4_0 ? 7 : -1;
 }
-static const int KQ_SYM[NSTATIC] = {16, 32, 64, 16, 16, 16, 16},
-                 KQ_CTX[NSTATIC] = {32 * 36, 64 * 36, Q6_CTX, Q8_CTX * 17, FL_HI, FL_HI, FL_HI + FL_LO};
+static const int KQ_SYM[NSTATIC] = {16, 32, 64, 16, 16, 16, 16, 16},
+                 KQ_CTX[NSTATIC] = {32 * 36 + KH_CTX, 64 * 36 + KH_CTX, Q6_CTX, Q8_CTX * 17, FL_HI, FL_HI, FL_HI + FL_LO, Q40_VCTX + FL_HI};
 /* segments coded with static tables: K-quants, not the lattice, not raw */
 static int is_static(const Seg *s) { return kq_index(s->type) >= 0 && (s->model & 255) == M_NORMAL; }
+static int is_kq45(uint32_t type) { return type == T_Q4K || type == T_Q5K; }
+static int is_float(uint32_t type) { return type == T_F32 || type == T_F16 || type == T_BF16; }
+/* static segments whose values are coded in rANS lanes: floats, Q4_K, Q5_K, Q4_0 */
+static int is_rans(const Seg *s) { return is_static(s) && (is_float(s->type) || is_kq45(s->type) || s->type == T_Q4_0); }
 
 /* frequencies summing to SM; every seen symbol gets at least 1, unseen ones 0 */
 static void quantize(const uint64_t *n, int k, uint16_t *f) {
@@ -1144,9 +1494,35 @@ static Seg *find_segments(const uint8_t *p, size_t n, uint64_t seg_target, int *
 }
 /* tensors (type, absolute offset, first dimension, element count) -> segments; every byte not in
    a supported tensor goes to byte-model segments. Takes ownership of the four arrays. */
+/* GGUF tensors of types tenz has no model for are stored as they are: the byte model gains little
+   on quantized weights and would take hours on a large model. Bytes per GGML type, for the report. */
+#define NGGML 40
+static uint64_t g_unmodelled[NGGML + 1];               /* [NGGML]: type ids beyond the table */
+static const char *ggml_name(int t) {
+    static const char *N[NGGML] = {"F32", "F16", "Q4_0", "Q4_1", "type 4", "type 5", "Q5_0", "Q5_1", "Q8_0", "Q8_1",
+        "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_K", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S",
+        "IQ2_S", "IQ4_XS", "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16", "type 31", "type 32", "type 33",
+        "TQ1_0", "TQ2_0", "type 36", "type 37", "type 38", "MXFP4"};
+    return t < NGGML ? N[t] : "other types";
+}
+typedef struct { uint64_t a, b; uint32_t t; } Span;
+static int cmp_u64(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
+static int cmp_span(const void *a, const void *b) { return cmp_u64(&((const Span *)a)->a, &((const Span *)b)->a); }
+
 static Seg *build_segments(uint64_t n, uint64_t seg_target, uint64_t nt, uint32_t *types, uint64_t *offs,
                            uint64_t *ne0s, uint64_t *nes, int *nseg) {
     Seg *s = NULL; int cnt = 0, cap = 0;
+    /* tensors of other types: from their offset to the next tensor's (their size needs no table) */
+    memset(g_unmodelled, 0, sizeof g_unmodelled);
+    uint64_t *so = xmalloc(nt * 8 + 8); memcpy(so, offs, nt * 8); qsort(so, nt, 8, cmp_u64);
+    Span *R = xmalloc(nt * sizeof *R + sizeof *R); uint64_t nr = 0;
+    for (uint64_t i = 0; i < nt; i++) {
+        if (type_index(types[i]) >= 0 || offs[i] >= n) continue;
+        uint64_t lo = 0, hi = nt;                          /* first offset above this one */
+        while (lo < hi) { uint64_t m = (lo + hi) / 2; if (so[m] <= offs[i]) lo = m + 1; else hi = m; }
+        R[nr++] = (Span){offs[i], lo < nt && so[lo] < n ? so[lo] : n, types[i]};
+    }
+    free(so); if (nr) qsort(R, nr, sizeof *R, cmp_span);
     for (uint64_t i = 0; i < nt; i++) {
         int ti = type_index(types[i]); if (ti < 0) continue;
         uint64_t e0 = ne0s[i], ne = nes[i]; int vpb = TYPES[ti].vpb, bs = TYPES[ti].bs;
@@ -1163,21 +1539,34 @@ static Seg *build_segments(uint64_t n, uint64_t seg_target, uint64_t nt, uint32_
     free(offs); free(ne0s); free(nes); free(types);
     if (cnt) qsort(s, cnt, sizeof *s, cmp_seg);
     for (int i = 1; i < cnt; i++) if (s[i].off < s[i - 1].off + s[i - 1].size) die("overlapping tensors");
-    int nt_seg = cnt; uint64_t at = 0;
+    int nt_seg = cnt; uint64_t at = 0, ri = 0;
     for (int i = 0; i <= nt_seg; i++) {
-        uint64_t end = i < nt_seg ? s[i].off : n;
-        /* metadata in 2 MiB pieces, coded in parallel: costs about 3% of the metadata's coded size
-           (each piece learns from scratch), but a model's metadata (10+ MiB of tokenizer data) is
-           otherwise one segment on one thread, the longest of the run on small models and on
-           machines with many cores */
-        uint64_t bt = (uint64_t)2 << 20;
-        for (uint64_t a = at; a < end; a += bt) {
-            uint64_t len = end - a < bt ? end - a : bt;
-            if (cnt == cap) { cap = cap * 2 + 64; s = realloc(s, cap * sizeof *s); if (!s) die("out of memory"); }
-            s[cnt++] = (Seg){a, len, len, 1, T_BYTES, M_NORMAL};
+        uint64_t gend = i < nt_seg ? s[i].off : n;
+        for (uint64_t ga = at; ga < gend;) {             /* the gap, without the unmodelled tensors */
+            while (ri < nr && R[ri].b <= ga) ri++;
+            uint64_t end = gend;
+            if (ri < nr && R[ri].a < gend) {
+                if (R[ri].a <= ga) {                         /* stored as is: left between the segments */
+                    uint64_t e = R[ri].b < gend ? R[ri].b : gend;
+                    g_unmodelled[R[ri].t < NGGML ? R[ri].t : NGGML] += e - ga; ga = e; continue;
+                }
+                end = R[ri].a;
+            }
+            uint64_t from = ga; ga = end;
+            /* metadata in 2 MiB pieces, coded in parallel: costs about 3% of the metadata's coded size
+               (each piece learns from scratch), but a model's metadata (10+ MiB of tokenizer data) is
+               otherwise one segment on one thread, the longest of the run on small models and on
+               machines with many cores */
+            uint64_t bt = (uint64_t)2 << 20;
+            for (uint64_t a = from; a < end; a += bt) {
+                uint64_t len = end - a < bt ? end - a : bt;
+                if (cnt == cap) { cap = cap * 2 + 64; s = realloc(s, cap * sizeof *s); if (!s) die("out of memory"); }
+                s[cnt++] = (Seg){a, len, len, 1, T_BYTES, M_NORMAL};
+            }
         }
         if (i < nt_seg) at = s[i].off + s[i].size;
     }
+    free(R);
     if (cnt) qsort(s, cnt, sizeof *s, cmp_seg);
     *nseg = cnt; return s;
 }
@@ -1272,8 +1661,7 @@ static uint64_t mem_avail(void) {
 static uint64_t model_bytes(const Seg *s) {
     const uint64_t B = sizeof(Bit);
     switch (s->type) {
-        case T_Q4K: return B * (4 * 65536 + 64 * 64 + 4096 * 64) + 2 * ((uint64_t)32 * 36 << 4);
-        case T_Q5K: return B * (4 * 65536 + 64 * 64 + 4096 * 64) + 2 * ((uint64_t)64 * 36 << 5);
+        case T_Q4K: case T_Q5K: case T_Q4_0: return 0; /* static tables only: counted in seg_need */
         case T_Q6K: return B * (3 * 65536 + 33 * 64 + 9 * 64 + 66 * 128 + 33 * 8) + 2 * (uint64_t)Q6_CTX * 64 + 16 * s->ne0;
         case T_Q8_0: return B * (2 * 65536 + (uint64_t)Q8_CTX * 256) + 8 * s->ne0;   /* bit tree: upper bound */
         case T_BYTES: { int hb = bytes_hb(s->size);
@@ -1290,7 +1678,8 @@ static uint64_t seg_need(const Seg *s, int mode, int phase) {
     if (mode == 1) return (s->model & 255) == M_RAW ? slack : slack + mb + z + (is_static(s) ? tab : 0);
     if (t < 0) return slack + mb + (mode == 2 ? 2 : 1) * z;
     if (phase == 1) return slack + mb + 2 * tab + (s->type == T_Q6K ? 2 * z : 0);   /* counts; Q6_K may try the lattice */
-    return slack + mb + tab + (mode == 2 ? 2 * (z + tab) : z);
+    uint64_t fl = is_float(s->type) || is_kq45(s->type) || s->type == T_Q4_0 ? 2 * z : 0;   /* rANS: word buffer and output, besides the input */
+    return slack + mb + tab + fl + (mode == 2 ? 2 * (z + tab) : z);
 }
 static uint64_t held_bytes(const Seg *s) { int t = kq_index(s->type); return (uint64_t)KQ_CTX[t] * (KQ_SYM[t] * 2 + 4); }
 #define MiB(x) ((double)(x) / 1048576.0)
@@ -1300,7 +1689,7 @@ static int plan_memory(Job *j, int threads, uint64_t limit) {
     j->need = xmalloc((j->n + 1) * sizeof *j->need); j->taken = calloc(j->n + 1, 1);
     if (!j->taken) die("out of memory");
     uint64_t mx = 0; for (int i = 0; i < j->n; i++) { j->need[i] = seg_need(&j->seg[i], j->mode, j->phase); if (j->need[i] > mx) mx = j->need[i]; }
-    const uint64_t base = 32u << 20;                     /* foldz itself: index, tables, stacks */
+    const uint64_t base = 32u << 20;                     /* tenz itself: index, tables, stacks */
     if (threads > j->n && j->n > 0) threads = j->n;
     if (threads < 1) threads = 1;
     if (limit) {
@@ -1313,7 +1702,7 @@ static int plan_memory(Job *j, int threads, uint64_t limit) {
         if (j->reserve > (2048ull << 20)) j->reserve = 2048ull << 20;
         if (avail) {
             j->budget = avail > j->reserve + base ? avail - j->reserve - base : 0; j->live = 1;
-            printf("memory: %.0f MiB free, keeping %.0f MiB for the device, foldz may use %.0f MiB\n",
+            printf("memory: %.0f MiB free, keeping %.0f MiB for the device, tenz may use %.0f MiB\n",
                    MiB(avail), MiB(j->reserve), MiB(j->budget));
         } else {
             j->budget = UINT64_MAX; j->live = 0;
@@ -1349,6 +1738,22 @@ static int claim(Job *j) {
         pthread_cond_wait(&j->cv, &j->mu);              /* woken when a running segment finishes */
     }
 }
+/* a static rANS segment: u32 length of the table section, the table section (range coder),
+   then the blocks or values (rANS) */
+static void static_rans_decode(Job *j, Seg *s, const uint8_t *in, size_t len, uint8_t *out) {
+    int t = kq_index(s->type); uint32_t tl;
+    if (len < 4) die("corrupt file");
+    memcpy(&tl, in, 4); if (tl > len - 4) die("corrupt file");
+    if (!j->dseed[t].f) die("corrupt file");
+    int16_t *U = xmalloc((size_t)KQ_CTX[t] * KQ_SYM[t] * 2);
+    Coder d; dec_init(&d, in + 4, tl); code_tables(&d, 1, &j->dseed[t], NULL, NULL, U);
+    if (is_kq45(s->type)) {
+        int bits = s->type == T_Q4K ? 4 : 5;
+        kq_lanes_decode(in + 4 + tl, len - 4 - tl, out, s->size / (bits == 4 ? 144 : 176), bits, U);
+    } else if (s->type == T_Q4_0) q40_decode(in + 4 + tl, len - 4 - tl, out, s->rows, s->ne0, U);
+    else float_decode(in + 4 + tl, len - 4 - tl, s->rows * s->ne0, s->type, U, out);
+    free(U);
+}
 /* a coded segment: store raw if not smaller, then write it (compress) or check it (test) */
 static void finish_coded(Job *j, int i, Seg *s, Coder *c, const uint8_t *src) {
     const uint8_t *outp = c->buf;
@@ -1359,10 +1764,13 @@ static void finish_coded(Job *j, int i, Seg *s, Coder *c, const uint8_t *src) {
         pwrite_all(j->fd, outp, c->pos, at); j->coff[i] = at;
     } else if (s->model != M_RAW) {
         uint8_t *buf = xmalloc(s->size); int16_t *U = NULL;
-        Coder d; dec_init(&d, c->buf, c->pos);
-        if (is_static(s)) { int t = kq_index(s->type); U = xmalloc((size_t)KQ_CTX[t] * KQ_SYM[t] * 2);
-                            code_tables(&d, 1, &j->dseed[t], NULL, NULL, U); d.stt = U; }
-        code_seg(&d, s, buf);
+        if (is_rans(s)) static_rans_decode(j, s, c->buf, c->pos, buf);
+        else {
+            Coder d; dec_init(&d, c->buf, c->pos);
+            if (is_static(s)) { int t = kq_index(s->type); U = xmalloc((size_t)KQ_CTX[t] * KQ_SYM[t] * 2);
+                                code_tables(&d, 1, &j->dseed[t], NULL, NULL, U); d.stt = U; }
+            code_seg(&d, s, buf);
+        }
         if (memcmp(buf, src, s->size)) __atomic_store_n(&j->failed, 1, __ATOMIC_RELAXED);
         free(buf); free(U);
     }
@@ -1377,12 +1785,24 @@ static void *worker(void *arg) {
         int t = kq_index(s->type);
         if (j->mode != 1) {
             const uint8_t *src = j->in + s->off;
-            uint32_t xf = j->hsym && t >= 0 && t < 3 ? H_SYM : 0;
+            uint32_t xf = j->hsym && s->type == T_Q6K ? H_SYM : 0;
             if (j->phase == 2 && t >= 0) {                   /* static tables, then the values */
                 size_t tn = (size_t)KQ_CTX[t] * KQ_SYM[t];
                 int16_t *U = xmalloc(tn * 2);
                 enc_init(&c, s->size); code_tables(&c, 0, &j->seed[t], j->ownf[i], j->ownN[i], U);
-                c.stt = U; code_seg(&c, s, (uint8_t *)src); enc_flush(&c); c.stt = NULL;
+                if (is_rans(s)) {                            /* table section, then everything else in rANS */
+                    enc_flush(&c);
+                    uint8_t *o = xmalloc(s->size + 16); size_t total = s->size;
+                    if (c.pos <= c.cap && c.pos + 4 + 4 * FL_LANES + 2 < s->size) {
+                        uint32_t tl = (uint32_t)c.pos; memcpy(o, &tl, 4); memcpy(o + 4, c.buf, tl);
+                        size_t r = is_kq45(s->type)
+                            ? kq_lanes_encode(src, s->size / (s->type == T_Q4K ? 144 : 176), s->type == T_Q4K ? 4 : 5, U, o + 4 + tl, s->size - 4 - tl)
+                            : s->type == T_Q4_0 ? q40_encode(src, s->rows, s->ne0, U, o + 4 + tl, s->size - 4 - tl)
+                            : float_encode(src, s->rows * s->ne0, s->type, U, o + 4 + tl, s->size - 4 - tl);
+                        if (r) total = 4 + tl + r;
+                    }
+                    free(c.buf); c.buf = o; c.pos = total; c.cap = s->size + 16;
+                } else { c.stt = U; code_seg(&c, s, (uint8_t *)src); enc_flush(&c); c.stt = NULL; }
                 free(j->ownf[i]); free(j->ownN[i]); j->ownf[i] = NULL; j->ownN[i] = NULL;
                 pthread_mutex_lock(&j->mu); j->used -= j->held[i]; pthread_mutex_unlock(&j->mu);
                 free(U);
@@ -1427,6 +1847,11 @@ static void *worker(void *arg) {
             pwrite_all(j->fd, j->in + j->coff[i], s->size, s->off);
         } else {
             uint8_t *buf = xmalloc(s->size); int16_t *U = NULL;
+            if (is_rans(s)) {
+                static_rans_decode(j, s, j->in + j->coff[i], j->clen[i], buf);
+                pwrite_all(j->fd, buf, s->size, s->off); free(buf);
+                goto seg_done;
+            }
             dec_init(&c, j->in + j->coff[i], j->clen[i]);
             if (is_static(s)) {
                 if (!j->dseed[t].f) die("corrupt file");
@@ -1436,6 +1861,7 @@ static void *worker(void *arg) {
             code_seg(&c, s, buf);
             pwrite_all(j->fd, buf, s->size, s->off); free(buf); free(U);
         }
+    seg_done:;
         double dt = now() - ts;
         pthread_mutex_lock(&j->mu);
         j->used -= j->need[i]; j->inflight--; pthread_cond_broadcast(&j->cv);
@@ -1499,6 +1925,8 @@ static void report(Seg *s, int n, uint64_t *clen, uint64_t total, uint64_t out_t
 
     if (n6) printf("  Q6_K segments using the AWQ lattice: %d of %d\n", nlat, n6);
     if (nraw) printf("  segments stored raw (coding would not shrink them): %d\n", nraw);
+    for (int t = 0; t <= NGGML; t++) if (g_unmodelled[t])
+        printf("  stored as they are (no model for the type): %.*f MiB of %s\n", MiB(g_unmodelled[t]) < 0.1 ? 3 : 1, MiB(g_unmodelled[t]), ggml_name(t));
     printf("  file  %9.1f MiB -> %9.1f MiB  (%5.2f%% saved)\n", total / 1048576.0, out_total / 1048576.0,
            100.0 * (1 - (double)out_total / total));
 }
@@ -1506,9 +1934,11 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
     size_t n; const uint8_t *p = map_file(in, &n);
     int ns; Seg *s = find_segments(p, n, segb, &ns);
     printf("%s: %.1f MiB, %d segments to code\n", in, n / 1048576.0, ns);
+    for (int t = 0; t <= NGGML; t++) if (g_unmodelled[t])
+        printf("note: %.*f MiB of %s tensors, a type tenz has no model for: stored as they are\n", MiB(g_unmodelled[t]) < 0.1 ? 3 : 1, MiB(g_unmodelled[t]), ggml_name(t));
     Job j; memset(&j, 0, sizeof j);
     j.mode = test ? 2 : 0; j.seg = s; j.n = ns; j.in = p; j.fd = -1; j.hsym = hsym; j.phase = 1;
-    if (hsym) printf("-H: block headers as symbols (faster to decompress, slightly larger)\n");
+    if (hsym) printf("-H: Q6_K block headers as symbols (faster to decompress, slightly larger)\n");
     threads = plan_memory(&j, threads, limit);
     j.clen = calloc(ns + 1, 8); j.coff = calloc(ns + 1, 8);
     j.ownf = calloc(ns + 1, sizeof *j.ownf); j.ownN = calloc(ns + 1, sizeof *j.ownN); j.held = calloc(ns + 1, 8);
@@ -1583,12 +2013,19 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
 
 static void cmd_decompress(const char *in, const char *out, int threads, uint64_t limit) {
     size_t n; const uint8_t *p = map_file(in, &n);
-    if (n < HDR) die("not a foldz file");
+    if (n < HDR) die("not a tenz file");
     if (memcmp(p, MAGIC, 8)) {
-        if (!memcmp(p, "FOLDZ", 5) && p[7] == '\n')
-            fprintf(stderr, "foldz: file format %.2s, but foldz " FOLDZ_VERSION " reads only format 14: "
-                            "use the foldz version that made it\n", (const char *)p + 5), exit(1);
-        die("not a foldz file");
+        if (!memcmp(p, "TENZ", 4) && p[6] == '\n')
+            fprintf(stderr, "tenz: file format %d, but tenz " TENZ_VERSION " reads only format " TENZ_FORMAT ": "
+                            "use the tenz version that made it\n", atoi((const char *)p + 4)), exit(1);
+        if (!memcmp(p, "FOLDZ", 5) && p[7] == '\n') {         /* the predecessor: released 0.9 to 0.15 */
+            int f = atoi((const char *)p + 5);
+            if (f >= 9 && f <= 15)
+                fprintf(stderr, "tenz: this is a foldz file (format %d): decompress it with foldz 0.%d, "
+                                "the predecessor of tenz\n", f, f), exit(1);
+            die("this file is from an unreleased foldz build: compress the original again with tenz");
+        }
+        die("not a tenz file");
     }
     uint64_t orig; uint32_t ns; memcpy(&orig, p + 8, 8); memcpy(&ns, p + 16, 4);
     uint64_t seed_off, seed_len; memcpy(&seed_off, p + 20, 8); memcpy(&seed_len, p + 28, 8);
@@ -1601,7 +2038,7 @@ static void cmd_decompress(const char *in, const char *out, int threads, uint64_
         memcpy(&tm, e + 24, 4); memcpy(&clen[i], e + 28, 8); memcpy(&coff[i], e + 36, 8);
         s[i].type = tm & 0xFFFF; s[i].model = tm >> 16;
         if (type_index(s[i].type) < 0 || !s[i].ne0) die("corrupt header");
-        {   uint32_t md = s[i].model & 255, fl = s[i].model >> 8, kq = s[i].type == T_Q4K || s[i].type == T_Q5K || s[i].type == T_Q6K;
+        {   uint32_t md = s[i].model & 255, fl = s[i].model >> 8, kq = s[i].type == T_Q6K;
             if (md != M_NORMAL && md != M_RAW && !(md == M_LATTICE && s[i].type == T_Q6K)) die("corrupt header");
             if (fl & ~1u) die("corrupt header");
             if (fl && (!kq || md == M_RAW)) die("corrupt header"); }
@@ -1628,15 +2065,15 @@ static void cmd_decompress(const char *in, const char *out, int threads, uint64_
     time_report(&j, t1 - t0, threads);
 }
 
-/* output name: given, or derived from the input (in.gguf -> in.gguf.foldz, in.gguf.foldz -> in.gguf) */
+/* output name: given, or derived from the input (in.gguf -> in.gguf.tenz, in.gguf.tenz -> in.gguf) */
 static char *out_name(const char *in, const char *given, int decompress) {
     if (given) return strdup(given);
-    size_t n = strlen(in), k = strlen(".foldz");
+    size_t n = strlen(in), k = strlen(".tenz");
     char *o = xmalloc(n + 8);
     if (decompress) {
-        if (n > k && !strcmp(in + n - k, ".foldz")) { memcpy(o, in, n - k); o[n - k] = 0; }
+        if (n > k && !strcmp(in + n - k, ".tenz")) { memcpy(o, in, n - k); o[n - k] = 0; }
         else { memcpy(o, in, n); memcpy(o + n, ".out", 5); }
-    } else { memcpy(o, in, n); memcpy(o + n, ".foldz", k + 1); }
+    } else { memcpy(o, in, n); memcpy(o + n, ".tenz", k + 1); }
     printf("output: %s\n", o); fflush(stdout);
     return o;
 }
@@ -1647,7 +2084,7 @@ static void check_output(const char *in, const char *out, int force) {
     if (stat(in, &a) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino)
         die("output is the input file itself");
     if (!force) {
-        fprintf(stderr, "foldz: %s already exists (use -f to overwrite)\n", out);
+        fprintf(stderr, "tenz: %s already exists (use -f to overwrite)\n", out);
         exit(1);
     }
 }
@@ -1655,17 +2092,17 @@ static void check_output(const char *in, const char *out, int force) {
 int main(int argc, char **argv) {
     init_tables(); init_stretch();
     if (argc == 2 && (argv[1][0] == 'v' || !strcmp(argv[1], "--version"))) {
-        printf("foldz " FOLDZ_VERSION " (file format 14)\n"); return 0;
+        printf("tenz " TENZ_VERSION " (file format " TENZ_FORMAT ")\n"); return 0;
     }
     if (argc < 3) {
-        fprintf(stderr, "usage: foldz c in [out.foldz] [-t threads] [-s segment_MiB] [-m MiB] [-H] [-f]\n"
-                        "       foldz d in.foldz [out] [-t threads] [-m MiB] [-f]\n"
-                        "       foldz t in [-t threads] [-s segment_MiB] [-m MiB] [-H]   (round-trip test, no files)\n"
-                        "       foldz v                                    (version)\n"
-                        "  out defaults to in + .foldz (c) or in without .foldz (d); -f overwrites an existing file\n"
-                        "  -H (c, t): block headers as symbols: faster to decompress, about 0.05%% larger\n"
+        fprintf(stderr, "usage: tenz c in [out.tenz] [-t threads] [-s segment_MiB] [-m MiB] [-H] [-f]\n"
+                        "       tenz d in.tenz [out] [-t threads] [-m MiB] [-f]\n"
+                        "       tenz t in [-t threads] [-s segment_MiB] [-m MiB] [-H]   (round-trip test, no files)\n"
+                        "       tenz v                                    (version)\n"
+                        "  out defaults to in + .tenz (c) or in without .tenz (d); -f overwrites an existing file\n"
+                        "  -H (c, t): Q6_K block headers as symbols: faster to decompress, slightly larger\n"
                         "  defaults: all cores, 48 MiB segments; memory: what is free, minus a reserve for the\n"
-                        "  device (15%% of RAM, 512 MiB to 2 GiB); -m sets foldz's memory limit instead\n");
+                        "  device (15%% of RAM, 512 MiB to 2 GiB); -m sets tenz's memory limit instead\n");
         return 1;
     }
     int threads = (int)sysconf(_SC_NPROCESSORS_ONLN), force = 0; uint64_t segb = 48, limit = 0; int hsym = 0;
@@ -1679,7 +2116,7 @@ int main(int argc, char **argv) {
             else { if (v < 64) die("-m needs at least 64 (MiB)"); limit = (uint64_t)v << 20; }
         } else if (!strcmp(argv[i], "-f")) force = 1;
         else if (!strcmp(argv[i], "-H")) hsym = 1;
-        else if (argv[i][0] == '-' && argv[i][1]) { fprintf(stderr, "foldz: unknown option %s\n", argv[i]); return 1; }
+        else if (argv[i][0] == '-' && argv[i][1]) { fprintf(stderr, "tenz: unknown option %s\n", argv[i]); return 1; }
         else if (np < 2) pos[np++] = argv[i];
         else die("too many file names");
     }

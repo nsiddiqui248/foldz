@@ -2,52 +2,29 @@
 
 **Lossless compressor for GGUF models.** Successor of foldz: versions up to 0.15 were released as foldz, and the numbers continue. tenz shrinks quantized GGUF files (Q4_K_M and similar) by 7–13%, and decompression gives back the identical file, byte for byte. General-purpose compressors (zip, xz, zstd) gain very little on these files, because quantized weights look almost random to them.
 
-tenz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models fitted to the data itself, using rANS and a range coder. Quantized values are coded as whole symbols (Q8_0 and floats as 4-bit symbols) from static tables: the compressor counts the whole file first and stores one shared seed table per type, and each segment stores only how its tables differ from the seed. Decompression therefore learns nothing and is faster than compression. Everything else (metadata, other tensor types, padding) is coded with a byte-level context-mixing model. Nothing depends on the model's name or architecture. Safetensors files (F32, F16, BF16 tensors) are parsed the same way.
+tenz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models fitted to the data itself, using rANS and a range coder. Quantized values are coded as whole symbols (Q8_0 and floats as 4-bit symbols) from static tables: the compressor counts the whole file first and stores one shared seed table per type, and each segment stores only how its tables differ from the seed. Decompression therefore learns nothing. Metadata and padding are coded with a byte-level context-mixing model; tensors of types tenz has no model for are stored as they are. Nothing depends on the model's name or architecture. Safetensors files (F32, F16, BF16 tensors) are parsed the same way.
 
 > Status: **0.20, pre-release** (file format 20). The file format may change before 1.0; a `.tenz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
 ## Results
 
-Nine public Q4_K_M models, tested with `t` (compress and decompress in memory, then compare). Every round trip was byte-identical. Measured on an Android phone in Termux, with 8 threads, using version 0.9. The current version gives smaller files:
+All measurements were made on a **Poco F5**, a mid-range Android phone, in Termux with 8 threads. Its chip is the Snapdragon 7+ Gen 2: 1 Cortex-X2 core at 2.91 GHz, 3 Cortex-A710 at 2.49 GHz and 4 Cortex-A510 at 1.8 GHz. Phones slow down as they heat up, so treat times as ±20%. Safetensors results are [below](#safetensors). Every round trip (`tenz t`: compress and decompress in memory, then compare) was byte-identical.
 
-| Model | 0.9 MiB | Current MiB | Saved | 0.9 round trip | Current round trip |
-|---|---|---|---|---|---|
-| Qwen3.5-2B | 1111.3 | **1108.4** | 8.54% | 58 s | 17 s |
-| Qwen3-4B | 2073.3 | **2070.0** * | 13.08% | 138 s | 47 s * |
-| Qwen2.5-7B-Instruct | 4113.8 | **4111.0** * | 7.95% | 220 s | 81 s * |
+| Model | Type | Size MiB | tenz MiB | Saved | Round trip | Version |
+|---|---|---|---|---|---|---|
+| Qwen3.5-2B | Q4_K_M | 1211.9 | **1108.5** | 8.53% | 17 s | 0.20 |
+| Qwen3-4B | Q4_K_M | 2381.6 | **2070.0** | 13.08% | 47 s | 0.12 |
+| Qwen2.5-7B-Instruct | Q4_K_M | 4466.1 | **4111.0** | 7.95% | 81 s | 0.12 |
+| Qwen3-0.6B | Q8_0 | 609.8 | **563.9** | 7.54% | 11 s | 0.13 |
+| Gemma-4-31B-it (QAT) | Q4_0 | 16833.3 | **14694.9** | 12.70% | 258 s | 0.20 |
 
-Qwen3.5-2B measured with tenz 0.18. \* measured with 0.12; later versions change these models' sizes by about 0.1 MiB (metadata in parallel pieces, tables for their small F32 tensors) and run faster (Qwen3.5-2B: 35 s with 0.12, 24 s with 0.14, 22 s with tenz 0.17, 17 s with tenz 0.18).
+Later versions change the older rows' sizes by about 0.1 MiB and run faster: Qwen3.5-2B took 58 s with 0.9, 24 s with 0.14 and 17 s with 0.20. [CHANGELOG.md](CHANGELOG.md) has the results of each version.
 
-A Q8_0 model, same phone:
+Qwen3-4B and Gemma-4-31B save the most partly because most of their Q6_K values sit on a coarser lattice, the pattern left when a model is converted from a 4-bit AWQ/GPTQ checkpoint or trained for quantization. tenz detects this per segment and codes the lattice instead: Gemma's Q6_K tensors saved 34.83%, Qwen3-4B's 23.2%.
 
-| Model | Size MiB | 0.13 MiB | Saved | Round trip |
-|---|---|---|---|---|
-| Qwen3-0.6B-Q8_0 | 609.8 | **563.9** | 7.54% | 11 s |
+Nine public Q4_K_M models with the first release (0.9). Current versions make each file a few MiB smaller and run about three times faster:
 
-A Q4_0 model, same phone, tenz 0.20:
-
-| Model | Size MiB | tenz MiB | Saved | Round trip |
-|---|---|---|---|---|
-| Gemma-4-31B-it Q4_0 (QAT) | 16833.3 | **14694.9** | 12.70% | 258 s |
-
-Its Q4_0 tensors saved 11.07%, and its Q6_K tensors 34.83%: the AWQ lattice model was chosen for every Q6_K segment, the pattern of quantization-aware training.
-
-With `-H` (versions 0.11 to 0.15, where it also covered Q4_K and Q5_K headers), Qwen2.5-7B-Instruct came out 0.5 MiB larger (4111.5 MiB) with 19% less work (66 s round trip).
-
-Speed on Qwen3.5-2B, same phone (it slows down as it heats up, so treat these as ±20%):
-
-| Version | Compress | Decompress |
-|---|---|---|
-| 0.9 | 58 s for compress and decompress together | |
-| 0.11 | 12.0 s | 17.9 s |
-| 0.12 | 22.8 s | **15.1 s** |
-| 0.14 | **11.9 s** | **12.6 s** |
-
-Version 0.12 traded slower compression (an extra counting pass) for faster decompression and smaller files: compress once, decompress many times.
-
-Results with version 0.9:
-
-| Model | Size MiB | Compressed MiB | Saved | Round trip |
+| Model | Size MiB | 0.9 MiB | Saved | Round trip |
 |---|---|---|---|---|
 | Qwen1.5-0.5B-Chat | 388.3 | 353.6 | 8.93% | 17 s |
 | Qwen3-0.6B | 378.3 | 348.7 | 7.82% | 17 s |
@@ -60,30 +37,28 @@ Results with version 0.9:
 | Gemma-4-E2B (fine-tune) | 3269.1 | 3016.3 | 7.73% | 220 s |
 | **All nine** | **17,094** | **15,614** | **8.66%** | |
 
-By tensor type, across the same models:
+By tensor type, across these models:
 
 | Type | Saved | Notes |
 |---|---|---|
 | Q4_K | 6.9–8.5% | the bulk of every Q4_K_M file |
-| Q5_K | 6.8% | one model |
-| Q6_K | 6.3–8.8% | **23.2%** on Qwen3-4B (23.6% with 0.12), where the AWQ lattice model was chosen for 36 of 43 segments |
-| Q4_0 | 11.1% | Gemma-4-31B-it (QAT), with tenz 0.20 |
-| Q8_0 | 6.8% | Qwen3-0.6B-Q8_0, with 0.13 |
-| BF16 | 33.9% | one model |
+| Q5_K | 6.8–7.1% | |
+| Q6_K | 6.3–8.8% | 23–35% on lattice models (above) |
+| Q4_0 | 11.1% | Gemma-4-31B-it |
+| Q8_0 | 6.8% | Qwen3-0.6B |
+| BF16 | 34.1–34.3% | |
 | F32 | 63–81% | norms and biases, small |
-| metadata | about 81% | tokenizer, tensor index |
-
-In Qwen3-4B, most Q6_K values sit on a coarser lattice, the pattern left when a model is converted from a 4-bit AWQ/GPTQ checkpoint. tenz detects this per segment and codes the lattice instead.
+| metadata | about 80% | tokenizer, tensor index |
 
 ### Compared with general compressors
 
-Qwen3.5-2B (Q4_K_M, 1211.9 MiB), on the same phone (8 cores):
+Qwen3.5-2B (Q4_K_M, 1211.9 MiB), on the same phone:
 
 | Compressor | Size MiB | Saved | Time |
 |---|---|---|---|
 | `zstd -19 --long=27 -T0` | 1186.9 | 25.0 MiB (2.07%) | 3 min 58 s, compress only (24.6 CPU-minutes) |
 | `xz -9 -T0` | 1190.4 | 21.6 MiB (1.78%) | 22 min 0 s, compress only (stayed on one thread) |
-| 0.12 | 1109.8 | **102.1 MiB (8.43%)** | 23 s compress, 15 s decompress |
+| tenz 0.20 | 1108.5 | **103.4 MiB (8.53%)** | 17 s to compress and decompress |
 
 Quantized weights are close to incompressible for general-purpose compressors; most of what they save is probably the metadata. tenz saves about four times as much here. In fairness: tenz only works this well on GGUF, while zstd and xz work on any file, and zstd decompresses far faster. `xz -9 -T0` stayed on one thread, most likely because multithreaded level 9 would need more memory than xz allows itself by default. Baselines for other models are welcome.
 
@@ -96,7 +71,7 @@ Quantized weights are close to incompressible for general-purpose compressors; m
 | Q4_0 | Whole blocks from static tables, coded with rANS in 4 interleaved lanes (one block per lane). Values as 4-bit symbols; contexts: the column's share of positive weights so far, whether the block's extreme (q = 0) was seen, the average distance from the centre so far, position. The scale d as four 4-bit symbols, like the floats. |
 | Q8_0 | Values as two 4-bit symbols (high nibble, then low nibble given the high one) from static tables. Context: the column's sign bias, extremes seen, average magnitude so far in the block. |
 | F32, F16, BF16 | Each 16 bits as four 4-bit symbols from static tables: sign, exponent and top mantissa bits each given the ones above (the first also given an earlier value); the low mantissa bits with little context, since they are close to random in trained weights. F32's low 16 bits the same way. Coded with rANS in 4 interleaved lanes: decoding needs no division, and the CPU works on 4 values at once. |
-| Everything else | Byte-level context mixing: orders 0–6, a match model, and a small logistic mixer. |
+| Metadata, padding | Byte-level context mixing: orders 0–6, a match model, and a small logistic mixer. |
 
 Safety and engineering:
 
@@ -151,7 +126,7 @@ cmp original.gguf restored.gguf && echo identical
 
 ## Benchmarks on other machines
 
-All numbers above were measured on one Android phone. To measure on your machine:
+All numbers above were measured on one phone, the Poco F5. To measure on your machine:
 
 ```
 gcc -O2 -pthread -ffp-contract=off -o tenz tenz.c -lm
@@ -164,22 +139,19 @@ gcc -O2 -pthread -ffp-contract=off -o tenz tenz.c -lm
 
 ### Safetensors
 
-tenz reads the safetensors header and codes F32, F16 and BF16 tensors with its float models; other tensor types and the header go to the byte model. One model, round trip on an Android phone with 8 cores:
+tenz reads the safetensors header and codes F32, F16 and BF16 tensors with its float models; other tensor types and the header go to the byte model. Same phone:
 
-| File | Size | Byte model only (0.13) | Float models (0.13.1) | Static tables (0.14) | Round trip: 0.13 → 0.13.1 → 0.14 |
-|---|---|---|---|---|---|
-| model-bf16.safetensors | 256.6 MiB | 171.9 MiB (33.0%) | 169.7 MiB (33.8%) | **169.2 MiB (34.1%)** | 303 s → 7.1 s → **2.1 s** |
-| model.safetensors (F32, converted from BF16) | 513.2 MiB | 171.9 MiB (66.5%) | 167.6 MiB (67.3%) | **165.8 MiB (67.7%)** | 438 s → 8.4 s → **3.6 s** |
+| File | Size | tenz | Round trip | Version |
+|---|---|---|---|---|
+| Llama-3.2-1B-Instruct (BF16) | 2357.1 MiB | **1549.8 MiB (34.25%)** | 20 s | 0.20 |
+| model-bf16.safetensors | 256.6 MiB | **169.2 MiB (34.07%)** | 2.1 s | 0.20 |
+| model.safetensors (F32, converted from BF16) | 513.2 MiB | **165.8 MiB (67.70%)** | 4.1 s | 0.19 |
 
-Llama-3.2-1B-Instruct, BF16 safetensors, tenz 0.20: 2357.1 → **1549.8 MiB (34.25% saved)**, round trip 21 s.
-
-The F32 file holds the same BF16 values with 16 zero bits added, and those cost almost nothing. As with GGUF, the gain on floats comes from the sign and exponent: the low mantissa bits of trained weights are close to random.
+The byte model alone, without the float models, gave 171.9 MiB for both small files. The F32 file holds the same BF16 values with 16 zero bits added, and those cost almost nothing. As with GGUF, the gain on floats comes from the sign and exponent: the low mantissa bits of trained weights are close to random.
 
 ### Other files
 
-Any other file is coded with the byte model alone. The other file types below were investigated during development. Full details, including methods and every measurement, are in [docs/FINDINGS.md](docs/FINDINGS.md).
-
-### On other files
+Any other file is coded with the byte model alone. These file types were investigated during development; full details, including methods and every measurement, are in [docs/FINDINGS.md](docs/FINDINGS.md).
 
 | File | xz -9 | Byte model | Note |
 |---|---|---|---|
@@ -207,7 +179,7 @@ The conclusion from all experiments: gains come from parsing the format and mode
 ## Limitations
 
 - **Supported tensor types:** Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, F32, F16 and BF16. GGUF tensors of other types (IQ quants, Q2_K, Q3_K, Q4_1, Q5_0...) are stored as they are, and tenz says so at the start: the byte model would gain a few percent at most on them and take hours on a large model. Safetensors tensors of other types (F8, integers) still go to the byte model.
-- **Speed:** on a phone with 8 threads, about 50 MiB/s to compress and 80 MiB/s to decompress. Within a segment each value still waits for the one before it, so tenz is far slower than zstd to decompress. The metadata (tokenizer data) is coded by a slower byte model, in 2 MiB pieces so that it runs in parallel. Most of the time goes into the quantized values. Q4_K, Q5_K, Q6_K, Q4_0 and floats are decoded in 4 rANS lanes without division. Q8_0 still uses the range coder, a division and a table search per symbol, and is now the slowest tensor type. Q6_K's column context (its running mean and variance in doubles) costs about a third of its decoding time.
+- **Speed:** on the Poco F5, a round trip (compress and decompress) runs at about 65–70 MiB/s: Qwen3.5-2B (1.2 GB) in 17 s, Gemma-4-31B (16.8 GB) in 258 s. That is far slower than zstd decompresses, because each value is decoded from a context model; Q4_K, Q5_K, Q6_K, Q4_0 and floats in 4 interleaved rANS lanes without division, Q8_0 still with the range coder (a division per symbol). Metadata goes through the slower byte model, in 2 MiB pieces so that it runs in parallel.
 - **Format:** pre-1.0, so it may change between versions.
 
 ## Help wanted

@@ -1,6 +1,6 @@
 # tenz
 
-**Lossless compressor for GGUF models.** Successor of [foldz](#from-foldz-to-tenz). tenz shrinks quantized GGUF files (Q4_K_M and similar) by 7–13%, and decompression gives back the identical file, byte for byte. General-purpose compressors (zip, xz, zstd) gain very little on these files, because quantized weights look almost random to them.
+**Lossless compressor for GGUF models.** Successor of foldz: versions up to 0.15 were released as foldz, and the numbers continue. tenz shrinks quantized GGUF files (Q4_K_M and similar) by 7–13%, and decompression gives back the identical file, byte for byte. General-purpose compressors (zip, xz, zstd) gain very little on these files, because quantized weights look almost random to them.
 
 tenz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models fitted to the data itself, using rANS and a range coder. Quantized values are coded as whole symbols (Q8_0 and floats as 4-bit symbols) from static tables: the compressor counts the whole file first and stores one shared seed table per type, and each segment stores only how its tables differ from the seed. Decompression therefore learns nothing and is faster than compression. Everything else (metadata, other tensor types, padding) is coded with a byte-level context-mixing model. Nothing depends on the model's name or architecture. Safetensors files (F32, F16, BF16 tensors) are parsed the same way.
 
@@ -8,19 +8,19 @@ tenz parses the GGUF file, unpacks each tensor's blocks into the real quantized 
 
 ## Results
 
-Nine public Q4_K_M models, tested with `foldz t` (compress and decompress in memory, then compare). Every round trip was byte-identical. Measured on an Android phone in Termux, with 8 threads, using foldz 0.9. The current version gives smaller files:
+Nine public Q4_K_M models, tested with `t` (compress and decompress in memory, then compare). Every round trip was byte-identical. Measured on an Android phone in Termux, with 8 threads, using version 0.9. The current version gives smaller files:
 
-| Model | foldz 0.9 MiB | Current MiB | Saved | foldz 0.9 round trip | Current round trip |
+| Model | 0.9 MiB | Current MiB | Saved | 0.9 round trip | Current round trip |
 |---|---|---|---|---|---|
 | Qwen3.5-2B | 1111.3 | **1108.4** | 8.54% | 58 s | 17 s |
 | Qwen3-4B | 2073.3 | **2070.0** * | 13.08% | 138 s | 47 s * |
 | Qwen2.5-7B-Instruct | 4113.8 | **4111.0** * | 7.95% | 220 s | 81 s * |
 
-Qwen3.5-2B measured with tenz 0.18. \* measured with foldz 0.12; later versions change these models' sizes by about 0.1 MiB (metadata in parallel pieces, tables for their small F32 tensors) and run faster (Qwen3.5-2B: 35 s with foldz 0.12, 24 s with foldz 0.14, 22 s with tenz 0.17, 17 s with tenz 0.18).
+Qwen3.5-2B measured with tenz 0.18. \* measured with 0.12; later versions change these models' sizes by about 0.1 MiB (metadata in parallel pieces, tables for their small F32 tensors) and run faster (Qwen3.5-2B: 35 s with 0.12, 24 s with 0.14, 22 s with tenz 0.17, 17 s with tenz 0.18).
 
 A Q8_0 model, same phone:
 
-| Model | Size MiB | foldz 0.13 MiB | Saved | Round trip |
+| Model | Size MiB | 0.13 MiB | Saved | Round trip |
 |---|---|---|---|---|
 | Qwen3-0.6B-Q8_0 | 609.8 | **563.9** | 7.54% | 11 s |
 
@@ -32,22 +32,22 @@ A Q4_0 model, same phone, tenz 0.20:
 
 Its Q4_0 tensors saved 11.07%, and its Q6_K tensors 34.83%: the AWQ lattice model was chosen for every Q6_K segment, the pattern of quantization-aware training.
 
-With `-H` (foldz 0.11 to 0.15, where it also covered Q4_K and Q5_K headers), Qwen2.5-7B-Instruct came out 0.5 MiB larger (4111.5 MiB) with 19% less work (66 s round trip).
+With `-H` (versions 0.11 to 0.15, where it also covered Q4_K and Q5_K headers), Qwen2.5-7B-Instruct came out 0.5 MiB larger (4111.5 MiB) with 19% less work (66 s round trip).
 
 Speed on Qwen3.5-2B, same phone (it slows down as it heats up, so treat these as ±20%):
 
 | Version | Compress | Decompress |
 |---|---|---|
-| foldz 0.9 | 58 s for compress and decompress together | |
-| foldz 0.11 | 12.0 s | 17.9 s |
-| foldz 0.12 | 22.8 s | **15.1 s** |
-| foldz 0.14 | **11.9 s** | **12.6 s** |
+| 0.9 | 58 s for compress and decompress together | |
+| 0.11 | 12.0 s | 17.9 s |
+| 0.12 | 22.8 s | **15.1 s** |
+| 0.14 | **11.9 s** | **12.6 s** |
 
-foldz 0.12 traded slower compression (an extra counting pass) for faster decompression and smaller files: compress once, decompress many times.
+Version 0.12 traded slower compression (an extra counting pass) for faster decompression and smaller files: compress once, decompress many times.
 
-Results with foldz 0.9:
+Results with version 0.9:
 
-| Model | Size MiB | foldz MiB | Saved | Round trip |
+| Model | Size MiB | Compressed MiB | Saved | Round trip |
 |---|---|---|---|---|
 | Qwen1.5-0.5B-Chat | 388.3 | 353.6 | 8.93% | 17 s |
 | Qwen3-0.6B | 378.3 | 348.7 | 7.82% | 17 s |
@@ -66,9 +66,9 @@ By tensor type, across the same models:
 |---|---|---|
 | Q4_K | 6.9–8.5% | the bulk of every Q4_K_M file |
 | Q5_K | 6.8% | one model |
-| Q6_K | 6.3–8.8% | **23.2%** on Qwen3-4B (23.6% with foldz 0.12), where the AWQ lattice model was chosen for 36 of 43 segments |
+| Q6_K | 6.3–8.8% | **23.2%** on Qwen3-4B (23.6% with 0.12), where the AWQ lattice model was chosen for 36 of 43 segments |
 | Q4_0 | 11.1% | Gemma-4-31B-it (QAT), with tenz 0.20 |
-| Q8_0 | 6.8% | Qwen3-0.6B-Q8_0, with foldz 0.13 |
+| Q8_0 | 6.8% | Qwen3-0.6B-Q8_0, with 0.13 |
 | BF16 | 33.9% | one model |
 | F32 | 63–81% | norms and biases, small |
 | metadata | about 81% | tokenizer, tensor index |
@@ -83,7 +83,7 @@ Qwen3.5-2B (Q4_K_M, 1211.9 MiB), on the same phone (8 cores):
 |---|---|---|---|
 | `zstd -19 --long=27 -T0` | 1186.9 | 25.0 MiB (2.07%) | 3 min 58 s, compress only (24.6 CPU-minutes) |
 | `xz -9 -T0` | 1190.4 | 21.6 MiB (1.78%) | 22 min 0 s, compress only (stayed on one thread) |
-| foldz 0.12 | 1109.8 | **102.1 MiB (8.43%)** | 23 s compress, 15 s decompress |
+| 0.12 | 1109.8 | **102.1 MiB (8.43%)** | 23 s compress, 15 s decompress |
 
 Quantized weights are close to incompressible for general-purpose compressors; most of what they save is probably the metadata. tenz saves about four times as much here. In fairness: tenz only works this well on GGUF, while zstd and xz work on any file, and zstd decompresses far faster. `xz -9 -T0` stayed on one thread, most likely because multithreaded level 9 would need more memory than xz allows itself by default. Baselines for other models are welcome.
 
@@ -166,7 +166,7 @@ gcc -O2 -pthread -ffp-contract=off -o tenz tenz.c -lm
 
 tenz reads the safetensors header and codes F32, F16 and BF16 tensors with its float models; other tensor types and the header go to the byte model. One model, round trip on an Android phone with 8 cores:
 
-| File | Size | Byte model only (foldz 0.13) | Float models (foldz 0.13.1) | Static tables (foldz 0.14) | Round trip: 0.13 → 0.13.1 → 0.14 |
+| File | Size | Byte model only (0.13) | Float models (0.13.1) | Static tables (0.14) | Round trip: 0.13 → 0.13.1 → 0.14 |
 |---|---|---|---|---|---|
 | model-bf16.safetensors | 256.6 MiB | 171.9 MiB (33.0%) | 169.7 MiB (33.8%) | **169.2 MiB (34.1%)** | 303 s → 7.1 s → **2.1 s** |
 | model.safetensors (F32, converted from BF16) | 513.2 MiB | 171.9 MiB (66.5%) | 167.6 MiB (67.3%) | **165.8 MiB (67.7%)** | 438 s → 8.4 s → **3.6 s** |
@@ -177,11 +177,11 @@ The F32 file holds the same BF16 values with 16 zero bits added, and those cost 
 
 ### Other files
 
-Any other file is coded with the byte model alone. The other file types below were investigated while developing foldz. Full details, including methods and every measurement, are in [docs/FINDINGS.md](docs/FINDINGS.md).
+Any other file is coded with the byte model alone. The other file types below were investigated during development. Full details, including methods and every measurement, are in [docs/FINDINGS.md](docs/FINDINGS.md).
 
-### foldz on other files
+### On other files
 
-| File | xz -9 | foldz | Note |
+| File | xz -9 | Byte model | Note |
 |---|---|---|---|
 | C++ source, 1.4 MiB | 128 KiB | 113 KiB | about 12% smaller than xz |
 | Python source corpus, 1.75 MB | 334,460 B | 298,333 B | 10.8% smaller than xz |
@@ -221,10 +221,6 @@ The conclusion from all experiments: gains come from parsing the format and mode
 When reporting results, include the full `tenz t` output, the model's Hugging Face name, and your CPU and OS.
 
 **Security:** please report suspected vulnerabilities (for example, a crafted `.tenz` file that crashes the decompressor) privately via GitHub's "Report a vulnerability" button on the Security tab, not as a public issue.
-
-## From foldz to tenz
-
-tenz was called foldz until version 0.15, after the fold model it started with; foldz 0.10 replaced the folds with symbol coding, and the name no longer fit. tenz names what it compresses, not how. The version numbers continue: foldz 0.15 was followed by tenz 0.17 (0.16 was never released), and the measurements above that name a foldz version were made with foldz. A `.foldz` file needs the foldz version that made it (format 15 needs foldz 0.15, and so on); `tenz d` tells you which one.
 
 ## License
 

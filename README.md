@@ -82,6 +82,32 @@ Quantized weights are close to incompressible for general-purpose compressors; m
 
 tenz saved 2–8 points more on every quantized model. The poster found compression equally fast, but Aqueous decompressed 3–4× faster: it is a general archiver tuned for speed, with Zstandard as a backend, while tenz decodes every value from a context model. Since then tenz decodes faster (0.22, 0.23), and `-q` trades about 0.6–0.8 points on Q4_K and Q5_K for about 35% faster coding of them; the gap is smaller but still there.
 
+### Compared with OverCompressing
+
+[OverCompressing](https://github.com/overdoingism/OverCompressing) is a lossless archiver for model families in safetensors and GGUF (Python, NumPy, zstd). It codes float tensors as byte planes with zstd, stores fine-tunes as deltas against their base model, and rebuilds quantized GGUF tensors from the float weights in the same archive. Its own figures, next to tenz on single files:
+
+| Case | OverCompressing | tenz |
+|---|---|---|
+| BF16 model on its own | 33.9% saved (Qwen2.5-0.5B), 33.8% (Qwen2.5-7B) | 34.1–34.3% |
+| Quantized GGUF on its own | 3–5% saved | 7.6–9.2% on Q4_K_M (13.1% on Qwen3-4B), 12.7% on Q4_0 |
+| Quantized GGUF with its float weights in the same archive | 98.4–99.7% saved (Q8_0, Q6_K) | not supported |
+| Fine-tune with its base model in the archive | 56–70% saved (Instruct over Base), near 100% for re-uploads | not supported |
+
+The two tools solve different problems. On a single file, which is what tenz compresses, tenz saves about as much on BF16 and roughly twice as much on quantized GGUF. When an archive holds a whole model family, OverCompressing's deltas and rebuilt quantizations save far more than any single-file coder can, because most of each file is predicted by another file.
+
+### Compared with published limits
+
+[Rothstein and Rothstein (2026)](https://www.ijcaonline.org/archives/volume187/number120/practical-limits-of-lossless-compression-for-bf16-transformer-llm-weights-with-companion-measurements-on-q4_k-tensors-in-gguf-q4_k_m-files/) measure lossless compression limits for BF16 weights and for Q4_K tensors in GGUF Q4_K_M files, with models up to Qwen2.5-7B-Instruct. Their ratios, as percent saved, next to tenz:
+
+| | Their bound | Their coder | tenz |
+|---|---|---|---|
+| BF16 weights | 33.1% (1.495×, marginal-byte ceiling) | 32.8% (1.488×) | 34.1–34.3% |
+| Q4_K tensors | 7.1% (1.076×, tensor-stream ceiling) | 4.9% (1.052×) | 6.9–8.5% |
+| Whole Q4_K_M files | 3.9–4.3% (1.041–1.045×) | | 7.6–9.2% (13.1% on Qwen3-4B); Qwen2.5-7B-Instruct 7.95% |
+| Q6_K tensors | about 1% (1.01×) | | 6.3–8.8% |
+
+Their ceilings are for coding each byte on its own distribution ("marginal"). tenz goes past them because it codes the real values given their context: a sub-block's zero point, its column's statistics, the extremes seen so far. That information a marginal-byte coder cannot see. The models differ between the two sets of measurements except Qwen2.5-7B-Instruct, so read the other rows as ranges.
+
 ## How it works
 
 | Tensor type | Model |
@@ -132,7 +158,6 @@ Options can go anywhere on the line:
 | `-s MiB` | segment size (default: 1/24 of the file, 8 to 48 MiB); lower uses less memory |
 | `-m MiB` | memory limit for tenz, instead of the automatic one |
 | `-q` | quick: Q4_K and Q5_K in a faster model, about 35% faster for them and 0.6–0.8 points less saved on them (Qwen3.5-2B: 8.18% instead of 8.54%). Recorded per segment, so `tenz d` needs no option |
-| `-H` | no longer needed: every block header is coded as symbols since 0.19. Accepted and ignored, so older scripts still work |
 | `-f` | overwrite an existing output file |
 
 tenz never overwrites a file unless `-f` is given, and never writes over its own input.
@@ -184,18 +209,6 @@ Any other file is coded with the byte model alone. These file types were investi
 | JPEG | 0% | about 1% | already entropy-coded |
 
 The byte model is strong on text and source code, about 6–12% better than xz. It cannot shrink data that is already compressed, and nothing can without parsing the format first.
-
-### Format-aware experiments (`experiments/`)
-
-These are measurement scripts, not compressors: they estimate what format-aware recompression could save, and verify that the original bytes can be rebuilt exactly.
-
-| Script | What it found |
-|---|---|
-| `deflate_scan.py` | Finds deflate streams in ZIP/APK/JAR, gzip, PNG and PDF, and searches zlib settings that reproduce them bit-exactly. A 74.35 MB APK: every stream matched, estimated 74.35 → 49.10 MB (34% saved), against about 69 MB with xz. A 2 GB downloads folder: only 10.9 MB was deflate, saving about 0.9 MB. A PNG from an unknown encoder: 0% matched. |
-| `jpeg_scan.py` | Decodes baseline JPEG to DCT coefficients, re-encodes byte-exact, and estimates coding with neighbour-context models. 16.6% saved on test images (11.6–19.2%), where xz saves 0%. |
-| `recomp.py` | Blind byte- or bit-level modelling of gzip, bzip2 and xz output gains nothing (it costs 4–6% extra). Format-aware recompression of a gzip file gave 19.9%, rebuilt byte-identical. |
-
-The conclusion from all experiments: gains come from parsing the format and modelling the real values with the right contexts, not from reading compressed bytes blindly. Mature tools already cover ZIP/PNG/PDF ([precomp](https://github.com/schnaader/precomp-cpp), [preflate-rs](https://github.com/microsoft/preflate-rs)) and JPEG ([Lepton](https://github.com/microsoft/lepton_jpeg_rust), about 22%). For quantized GGUF, [Aqueous](https://github.com/lifthrasiir/aqueous/) is the closest tool we know of ([comparison above](#compared-with-aqueous)). [ZipNN](https://arxiv.org/abs/2411.05239) targets floating-point (BF16) model weights.
 
 ## Limitations
 

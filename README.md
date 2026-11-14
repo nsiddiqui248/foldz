@@ -4,7 +4,7 @@
 
 tenz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models fitted to the data itself, using rANS and a range coder. Quantized values are coded as whole symbols (Q8_0 and floats as 4-bit symbols) from static tables: the compressor counts the whole file first and stores one shared seed table per type, and each segment stores only how its tables differ from the seed. Decompression therefore learns nothing. Metadata and padding are coded with a byte-level context-mixing model; tensors of types tenz has no model for are stored as they are. Nothing depends on the model's name or architecture. Safetensors files (F32, F16, BF16 tensors) are parsed the same way.
 
-> Status: **0.20, pre-release** (file format 20). The file format may change before 1.0; a `.tenz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
+> Status: **0.23, pre-release** (file format 23). The file format may change before 1.0; a `.tenz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
 ## Results
 
@@ -62,14 +62,34 @@ Qwen3.5-2B (Q4_K_M, 1211.9 MiB), on the same phone:
 
 Quantized weights are close to incompressible for general-purpose compressors; most of what they save is probably the metadata. tenz saves about four times as much here. In fairness: tenz only works this well on GGUF, while zstd and xz work on any file, and zstd decompresses far faster. `xz -9 -T0` stayed on one thread, most likely because multithreaded level 9 would need more memory than xz allows itself by default. Baselines for other models are welcome.
 
+### Compared with Aqueous
+
+[Aqueous](https://github.com/lifthrasiir/aqueous/) is a format-aware archiver that also recompresses quantized GGUF. A comparison posted on Reddit (Ryzen 9700X, 128 GB RAM, Windows 11, with the tenz version of that time):
+
+| Model | Type | Original MiB | aqr MiB | aqr saved | tenz MiB | tenz saved | Gap (pt) |
+|---|---|---|---|---|---|---|---|
+| Qwen3-0.6B | Q4_K_M | 378.3 | 361.5 | 4.44% | 347.1 | 8.25% | 3.81 |
+| Qwen3-0.6B | Q8_0 | 609.8 | 577.9 | 5.24% | 563.8 | 7.55% | 2.31 |
+| Qwen1.5-0.5B-Chat | Q4_K_M | 388.3 | 370.6 | 4.55% | 352.7 | 9.16% | 4.61 |
+| Qwen2.5-1.5B-Instruct | Q4_K_M | 1065.6 | 1023.7 | 3.93% | 982.2 | 7.82% | 3.90 |
+| Qwen3.5-2B | Q4_K_M | 1211.9 | 1161.4 | 4.17% | 1108.5 | 8.53% | 4.36 |
+| Llama-3.2-3B-Instruct | Q4_K_M | 1925.8 | 1852.2 | 3.83% | 1778.2 | 7.67% | 3.84 |
+| Qwen2.5-Coder-3B | Q4_K_M | 2007.4 | 1905.4 | 5.08% | 1830.5 | 8.81% | 3.73 |
+| Qwen3-4B | Q4_K_M | 2381.6 | 2264.1 | 4.93% | 2069.9 | 13.09% | 8.15 |
+| Qwen2.5-7B-Instruct | Q4_K_M | 4466.1 | 4295.5 | 3.82% | 4108.6 | 8.00% | 4.19 |
+| Gemma-4-31B-it QAT | Q4_0 | 16833.3 | 15399.7 | 8.52% | 14694.9 | 12.70% | 4.19 |
+| Llama-3.2-1B-Instruct | BF16 (safetensors) | 2357.1 | 1561.5 | 33.75% | 1549.8 | 34.25% | 0.50 |
+
+tenz saved 2–8 points more on every quantized model. The poster found compression equally fast, but Aqueous decompressed 3–4× faster: it is a general archiver tuned for speed, with Zstandard as a backend, while tenz decodes every value from a context model. Since then tenz decodes faster (0.22, 0.23), and `-q` trades about 0.6–0.8 points on Q4_K and Q5_K for about 35% faster coding of them; the gap is smaller but still there.
+
 ## How it works
 
 | Tensor type | Model |
 |---|---|
-| Q4_K, Q5_K | Whole blocks from static tables (seed per file, differences per segment), coded with rANS in 4 interleaved lanes. Values as whole symbols, one sub-block per lane; contexts: the sub-block's zero point, extremes seen (0 and max), position. Headers one block per lane: d and dmin as four 4-bit symbols each (like the floats), scales and mins as a 2-bit and a 4-bit symbol (scale given the previous scale, min given its scale and the previous min). |
+| Q4_K, Q5_K | Whole blocks from static tables (seed per file, differences per segment), coded with rANS in 4 interleaved lanes. Values as whole symbols, one sub-block per lane; contexts: the sub-block's zero point, extremes seen (0 and max), position. With `-q`, the zero point alone, decoded by one table lookup per value. Headers one block per lane: d and dmin as four 4-bit symbols each (like the floats), scales and mins as a 2-bit and a 4-bit symbol (scale given the previous scale, min given its scale and the previous min). |
 | Q6_K | Whole blocks from static tables, coded with rANS in 4 interleaved lanes (one block's header per lane, 4 sub-blocks of each block per lane), in streams of 2048 blocks. Values as whole symbols; context: the column's running offset and width (mean and spread in units of the sub-block's step), position, extremes seen. Header: d as four 4-bit symbols, each scale as two (the low one given the high one and the whole previous scale). Or, if smaller, the AWQ lattice model for models converted from 4-bit AWQ/GPTQ checkpoints or trained for quantization: per 16-value sub-block the lattice size and span, then per value its lattice step (given the lattice size and its column's sign share and average step size over the rows above) and the error, with the same headers, its own static tables and lanes over consecutive sub-blocks. |
 | Q4_0 | Whole blocks from static tables, coded with rANS in 4 interleaved lanes (one block per lane). Values as 4-bit symbols; contexts: the column's share of positive weights so far, whether the block's extreme (q = 0) was seen, the average distance from the centre so far, position. The scale d as four 4-bit symbols, like the floats. |
-| Q8_0 | Values as two 4-bit symbols (high nibble, then low nibble given the high one) from static tables. Context: the column's sign bias, extremes seen, average magnitude so far in the block. |
+| Q8_0 | Whole blocks from static tables, coded with rANS in 4 interleaved lanes (one block per lane). Values as two 4-bit symbols (high nibble, then low nibble given the high one); context: the column's sign bias, extremes seen, average magnitude so far in the block. The scale d as four 4-bit symbols given the previous block's d. |
 | F32, F16, BF16 | Each 16 bits as four 4-bit symbols from static tables: sign, exponent and top mantissa bits each given the ones above (the first also given an earlier value); the low mantissa bits with little context, since they are close to random in trained weights. F32's low 16 bits the same way. Coded with rANS in 4 interleaved lanes: decoding needs no division, and the CPU works on 4 values at once. |
 | Metadata, padding | Byte-level context mixing: orders 0–6, a match model, and a small logistic mixer. |
 
@@ -111,6 +131,7 @@ Options can go anywhere on the line:
 | `-t N` | threads (default: all cores) |
 | `-s MiB` | segment size (default: 1/24 of the file, 8 to 48 MiB); lower uses less memory |
 | `-m MiB` | memory limit for tenz, instead of the automatic one |
+| `-q` | quick: Q4_K and Q5_K in a faster model, about 35% faster for them and 0.6–0.8 points less saved on them (Qwen3.5-2B: 8.18% instead of 8.54%). Recorded per segment, so `tenz d` needs no option |
 | `-H` | no longer needed: every block header is coded as symbols since 0.19. Accepted and ignored, so older scripts still work |
 | `-f` | overwrite an existing output file |
 
@@ -174,12 +195,12 @@ These are measurement scripts, not compressors: they estimate what format-aware 
 | `jpeg_scan.py` | Decodes baseline JPEG to DCT coefficients, re-encodes byte-exact, and estimates coding with neighbour-context models. 16.6% saved on test images (11.6–19.2%), where xz saves 0%. |
 | `recomp.py` | Blind byte- or bit-level modelling of gzip, bzip2 and xz output gains nothing (it costs 4–6% extra). Format-aware recompression of a gzip file gave 19.9%, rebuilt byte-identical. |
 
-The conclusion from all experiments: gains come from parsing the format and modelling the real values with the right contexts, not from reading compressed bytes blindly. Mature tools already cover ZIP/PNG/PDF ([precomp](https://github.com/schnaader/precomp-cpp), [preflate-rs](https://github.com/microsoft/preflate-rs)) and JPEG ([Lepton](https://github.com/microsoft/lepton_jpeg_rust), about 22%). For quantized GGUF we found no comparable tool, which is the gap tenz fills. [ZipNN](https://arxiv.org/abs/2411.05239) targets floating-point (BF16) model weights.
+The conclusion from all experiments: gains come from parsing the format and modelling the real values with the right contexts, not from reading compressed bytes blindly. Mature tools already cover ZIP/PNG/PDF ([precomp](https://github.com/schnaader/precomp-cpp), [preflate-rs](https://github.com/microsoft/preflate-rs)) and JPEG ([Lepton](https://github.com/microsoft/lepton_jpeg_rust), about 22%). For quantized GGUF, [Aqueous](https://github.com/lifthrasiir/aqueous/) is the closest tool we know of ([comparison above](#compared-with-aqueous)). [ZipNN](https://arxiv.org/abs/2411.05239) targets floating-point (BF16) model weights.
 
 ## Limitations
 
 - **Supported tensor types:** Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, F32, F16 and BF16. GGUF tensors of other types (IQ quants, Q2_K, Q3_K, Q4_1, Q5_0...) are stored as they are, and tenz says so at the start: the byte model would gain a few percent at most on them and take hours on a large model. Safetensors tensors of other types (F8, integers) still go to the byte model.
-- **Speed:** on the Poco F5, a round trip (compress and decompress) runs at about 65–70 MiB/s: Qwen3.5-2B (1.2 GB) in 17 s, Gemma-4-31B (16.8 GB) in 258 s. That is far slower than zstd decompresses, because each value is decoded from a context model; Q4_K, Q5_K, Q6_K, Q4_0 and floats in 4 interleaved rANS lanes without division, Q8_0 still with the range coder (a division per symbol). Metadata goes through the slower byte model, in 2 MiB pieces so that it runs in parallel.
+- **Speed:** on the Poco F5 with 8 threads, Qwen3.5-2B (1.2 GB) compresses in about 7 s and decompresses in about 7 s (0.22). That is far slower than zstd decompresses, because each value is decoded from a context model, every tensor type in 4 interleaved rANS lanes without division. `-q` makes Q4_K and Q5_K faster at a small cost in size. Metadata goes through the slower byte model, in pieces so that it runs in parallel.
 - **Format:** pre-1.0, so it may change between versions.
 
 ## Help wanted

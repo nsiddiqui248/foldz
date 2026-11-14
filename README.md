@@ -80,7 +80,7 @@ Quantized weights are close to incompressible for general-purpose compressors; m
 | Gemma-4-31B-it QAT | Q4_0 | 16833.3 | 15399.7 | 8.52% | 14694.9 | 12.70% | 4.19 |
 | Llama-3.2-1B-Instruct | BF16 (safetensors) | 2357.1 | 1561.5 | 33.75% | 1549.8 | 34.25% | 0.50 |
 
-tenz saved 2–8 points more on every quantized model. The poster found compression equally fast, but Aqueous decompressed 3–4× faster: it is a general archiver tuned for speed, with Zstandard as a backend, while tenz decodes every value from a context model. Since then tenz decodes faster (0.22, 0.23), and `-q` trades about 0.6–0.8 points on Q4_K and Q5_K for about 35% faster coding of them; the gap is smaller but still there.
+tenz saved 2–8 points more on every quantized model. The poster found compression equally fast, but Aqueous decompressed 3–4× faster: it is a general archiver tuned for speed, with Zstandard as a backend, while tenz decodes every value from a context model. Since then tenz decodes faster (0.22, 0.23), and `-q` trades a fraction of a point for faster coding (Q4_K and Q5_K about 35%, Q4_0 about 20%, BF16 and Q8_0 about 15–25%); the gap is smaller but still there.
 
 ### Compared with OverCompressing
 
@@ -157,7 +157,7 @@ Options can go anywhere on the line:
 | `-t N` | threads (default: all cores) |
 | `-s MiB` | segment size (default: 1/24 of the file, 8 to 48 MiB); lower uses less memory |
 | `-m MiB` | memory limit for tenz, instead of the automatic one |
-| `-q` | quick: Q4_K and Q5_K in a faster model, about 35% faster for them and 0.6–0.8 points less saved on them (Qwen3.5-2B: 8.18% instead of 8.54%). Recorded per segment, so `tenz d` needs no option |
+| `-q` | quick: faster models for Q4_K, Q5_K, Q4_0, Q8_0 and floats, at a small cost in size. Measured: Qwen3.5-2B Q4_K_M 8.18% instead of 8.54% saved (Q4_K, Q5_K work about 35% less); Llama-3.2-1B Q8_0 7.82% instead of 8.27% (Q8_0 work 14% less); Llama-3.2-1B BF16 34.19% instead of 34.25% (BF16 work about 8–27% less). Gemma-4-31B Q4_0 12.19% instead of 12.70% (Q4_0 work 21% less). Float segments stay normal where the shortcut would cost more than 1%. Recorded per segment, so `tenz d` needs no option |
 | `-f` | overwrite an existing output file |
 
 tenz never overwrites a file unless `-f` is given, and never writes over its own input.
@@ -213,7 +213,7 @@ The byte model is strong on text and source code, about 6–12% better than xz. 
 ## Limitations
 
 - **Supported tensor types:** Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, F32, F16 and BF16. GGUF tensors of other types (IQ quants, Q2_K, Q3_K, Q4_1, Q5_0...) are stored as they are, and tenz says so at the start: the byte model would gain a few percent at most on them and take hours on a large model. Safetensors tensors of other types (F8, integers) still go to the byte model.
-- **Speed:** on the Poco F5 with 8 threads, Qwen3.5-2B (1.2 GB) compresses in about 7 s and decompresses in about 7 s (0.22). That is far slower than zstd decompresses, because each value is decoded from a context model, every tensor type in 4 interleaved rANS lanes without division. `-q` makes Q4_K and Q5_K faster at a small cost in size. Metadata goes through the slower byte model, in pieces so that it runs in parallel.
+- **Speed:** on the Poco F5 with 8 threads, Qwen3.5-2B (1.2 GB) compresses in about 7 s and decompresses in about 7 s (0.22). That is far slower than zstd decompresses, because each value is decoded from a context model, every tensor type in 4 interleaved rANS lanes without division. `-q` makes most types faster at a small cost in size. Metadata goes through the slower byte model, in pieces so that it runs in parallel.
 - **Format:** pre-1.0, so it may change between versions.
 
 ## Help wanted

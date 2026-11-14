@@ -112,7 +112,7 @@ static const char MAGIC[8] = {'T','E','N','Z','2','3','\n', 0};    /* file forma
    string array; T_BYTES: everything else outside the tensors */
 enum { T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_BF16 = 30,
        T_M32 = 0xFFFD, T_STRS = 0xFFFE, T_BYTES = 0xFFFF };
-enum { M_NORMAL = 0, M_LATTICE = 1, M_QUICK = 2, M_RAW = 255 };   /* M_QUICK: Q4_K, Q5_K with -q */
+enum { M_NORMAL = 0, M_LATTICE = 1, M_QUICK = 2, M_RAW = 255 };   /* M_QUICK: -q (Q4_K, Q5_K, Q4_0, Q8_0, floats) */
 static inline uint32_t fl_type(uint32_t t) { return t == T_M32 ? T_F32 : t; }   /* the float model's type */
 
 typedef struct { uint32_t id; int vpb, bs; const char *name; } TypeInfo;
@@ -394,6 +394,10 @@ typedef float Q6F;
 /* refill a decoder state below RANS_L with the next 16-bit word, without a branch (whether a word is
    needed is data-dependent and mispredicts); past the end of the input it reads zeros, as before */
 static const uint8_t RANS_ZERO2[2] = {0, 0};
+/* the same when at least 2 bytes are known to be left (callers check once per run of symbols) */
+#define RANS_REFILL_NC(ST, P) do {                                                                \
+    uint32_t need_ = (ST) < RANS_L; uint16_t w16; memcpy(&w16, (P), 2);                           \
+    (ST) = ((ST) << (need_ << 4)) | (w16 & (0u - need_)); (P) += 2 * need_; } while (0)
 #ifdef TENZ_BRANCH_REFILL
 #define RANS_REFILL(ST, P, END) do { if ((ST) < RANS_L && (P) + 2 <= (END)) { uint16_t w16; memcpy(&w16, (P), 2); (P) += 2; (ST) = ((ST) << 16) | w16; } } while (0)
 #else
@@ -425,6 +429,11 @@ static inline void fl_syms(uint32_t type, uint32_t v, int pa, int pb, int *ctx, 
         sym[7] = ld; ctx[7] = FL_HI + 48 + lc;
     }
 }
+/* -q: the symbols coded as uniform (no table, no search): the low mantissa nibbles, which are close
+   to random in trained weights. BF16: the last nibble; F16: the last two; F32: the last of the high
+   half and the whole low half. Pass 1 keeps a segment normal if its counts say this costs more than
+   1% (F32 converted from BF16, whose low half is all zeros, for example). */
+static inline int fl_uni(uint32_t type, int k) { return type == T_BF16 ? k == 3 : type == T_F16 ? k >= 2 : k >= 3; }
 /* pass 1: count */
 static void float_count(uint32_t *cnt, const uint8_t *data, uint64_t n, uint32_t type) {
     int pa[FL_LANES] = {0}, pb[FL_LANES] = {0}, ctx[8], sym[8], ns = fl_nsym(type);
@@ -437,7 +446,7 @@ static void float_count(uint32_t *cnt, const uint8_t *data, uint64_t n, uint32_t
 }
 /* encode: symbols in reverse order, words written backwards; out = lane states, then the words.
    Returns the length, or 0 if it does not fit in cap. U: cumulative tables (sum SM). */
-static size_t float_encode(const uint8_t *data, uint64_t n, uint32_t type, const int16_t *U, uint8_t *out, size_t cap) {
+static size_t float_encode(const uint8_t *data, uint64_t n, uint32_t type, int quick, const int16_t *U, uint8_t *out, size_t cap) {
     size_t head = 4 * FL_LANES;
     if (cap < head + 2) return 0;
     size_t nw = (cap - head) / 2; uint16_t *w = xmalloc(nw * 2 + 2), *wp = w + nw;
@@ -451,6 +460,7 @@ static size_t float_encode(const uint8_t *data, uint64_t n, uint32_t type, const
         for (int k = ns - 1; k >= 0; k--) {
             const int16_t *T = U + (size_t)ctx[k] * 16;
             uint32_t start = sym[k] ? (uint32_t)T[sym[k] - 1] : 0, f = (uint32_t)T[sym[k]] - start;
+            if (quick && fl_uni(type, k)) { start = (uint32_t)sym[k] << 8; f = SM / 16; }
             if (!f) die("internal: float symbol without frequency");
             if ((uint64_t)st >= ((uint64_t)(RANS_L >> SM_BITS) << 16) * f) {   /* 64-bit: f = SM gives 2^32 */ if (wp == w) { free(w); return 0; } *--wp = (uint16_t)st; st >>= 16; }
             st = ((st / f) << SM_BITS) + (st % f) + start;
@@ -474,7 +484,7 @@ static inline int fl_search(const int16_t *T, uint32_t slot) {    /* number of c
 #endif
 }
 /* decode; corrupt input gives wrong values, never reads outside in[0..len) */
-HOT void float_decode(const uint8_t *in, size_t len, uint64_t n, uint32_t type, const int16_t *U, uint8_t *data) {
+HOT void float_decode_impl(const uint8_t *in, size_t len, uint64_t n, const uint32_t type, const int quick, const int16_t *U, uint8_t *data) {
     size_t head = 4 * FL_LANES;
     if (len < head) die("corrupt file");
     uint32_t x[FL_LANES]; int pa[FL_LANES] = {0}, pb[FL_LANES] = {0};
@@ -487,15 +497,20 @@ HOT void float_decode(const uint8_t *in, size_t len, uint64_t n, uint32_t type, 
         st = f * (st >> SM_BITS) + slot - s0;                                                     \
         RANS_REFILL(st, p, end);                                                                \
         (OUT) = sy; } while (0)
+    /* symbol K: uniform with -q where fl_uni says so (16 slots of 256: the symbol is the slot's top) */
+    #define FL_DSYMQ(K, CTX, OUT) do {                                                          \
+        if (quick && fl_uni(type, K)) { uint32_t slot = st & (SM - 1); (OUT) = (int)(slot >> 8);  \
+            st = (SM / 16) * (st >> SM_BITS) + (slot & 255); RANS_REFILL(st, p, end); }         \
+        else FL_DSYM(CTX, OUT); } while (0)
     /* one value of lane L: its state and history in locals, so the 4 lanes are independent chains */
     #define FL_DVAL(L, I) do {                                                                  \
         uint32_t st = st##L; int a, b, cc, d;                                                   \
-        FL_DSYM(pa##L, a); FL_DSYM(16 + ((a << 4) | pb##L), b);                                 \
-        FL_DSYM(272 + ((a << 4) | b), cc); FL_DSYM(528 + cc, d);                                \
+        FL_DSYMQ(0, pa##L, a); FL_DSYMQ(1, 16 + ((a << 4) | pb##L), b);                         \
+        FL_DSYMQ(2, 272 + ((a << 4) | b), cc); FL_DSYMQ(3, 528 + cc, d);                        \
         uint32_t h = (uint32_t)((a << 12) | (b << 8) | (cc << 4) | d); pa##L = a; pb##L = b;   \
         if (type == T_F32) {                                                                    \
             int la, lb, lc, ld;                                                                 \
-            FL_DSYM(FL_HI + d, la); FL_DSYM(FL_HI + 16 + la, lb); FL_DSYM(FL_HI + 32 + lb, lc); FL_DSYM(FL_HI + 48 + lc, ld); \
+            FL_DSYMQ(4, FL_HI + d, la); FL_DSYMQ(5, FL_HI + 16 + la, lb); FL_DSYMQ(6, FL_HI + 32 + lb, lc); FL_DSYMQ(7, FL_HI + 48 + lc, ld); \
             uint32_t v = (h << 16) | (uint32_t)((la << 12) | (lb << 8) | (lc << 4) | ld);        \
             memcpy(data + (I) * 4, &v, 4);                                                      \
         } else wr16(data + (I) * 2, (uint16_t)h);                                               \
@@ -509,7 +524,13 @@ HOT void float_decode(const uint8_t *in, size_t len, uint64_t n, uint32_t type, 
     if (i < n) { FL_DVAL(1, i); i++; }
     if (i < n) { FL_DVAL(2, i); i++; }
     #undef FL_DVAL
+    #undef FL_DSYMQ
     #undef FL_DSYM
+}
+static void float_decode(const uint8_t *in, size_t len, uint64_t n, uint32_t type, int quick, const int16_t *U, uint8_t *data) {
+    if (type == T_F32) { if (quick) float_decode_impl(in, len, n, T_F32, 1, U, data); else float_decode_impl(in, len, n, T_F32, 0, U, data); }
+    else if (type == T_F16) { if (quick) float_decode_impl(in, len, n, T_F16, 1, U, data); else float_decode_impl(in, len, n, T_F16, 0, U, data); }
+    else { if (quick) float_decode_impl(in, len, n, T_BF16, 1, U, data); else float_decode_impl(in, len, n, T_BF16, 0, U, data); }
 }
 static void float_code(Coder *c, uint8_t *data, uint64_t n, uint32_t type) {
     if (!c->dec && c->cnt_only) float_count(c->cnt, data, n, type);
@@ -592,11 +613,15 @@ static void kq_zb(const uint8_t *B, int bits, int *zb) {             /* the sub-
 /* contexts of a block's 256 values, in block order (q: the unpacked values) */
 static void kq_val_ctx(const uint8_t *B, int bits, const uint8_t *q, uint16_t *ctx, int quick) {
     int zb[8], maxv = (1 << bits) - 1; kq_zb(B, bits, zb);
+    if (quick) {                                   /* the zero point alone: a fill per sub-block */
+        for (int s = 0; s < 8; s++) for (int i = 0; i < 32; i++) ctx[s * 32 + i] = (uint16_t)(zb[s] * 36);
+        return;
+    }
     for (int s = 0; s < 8; s++) {
         int n0 = 0, nm = 0;
         for (int i = 0; i < 32; i++) {
             int idx = s * 32 + i;
-            ctx[idx] = (uint16_t)(quick ? zb[s] * 36 : (zb[s] * 9 + (n0 < 2 ? n0 : 2) * 3 + (nm < 2 ? nm : 2)) * 4 + (i >> 3));
+            ctx[idx] = (uint16_t)((zb[s] * 9 + (n0 < 2 ? n0 : 2) * 3 + (nm < 2 ? nm : 2)) * 4 + (i >> 3));
             n0 += q[idx] == 0; nm += q[idx] == maxv;
         }
     }
@@ -693,13 +718,13 @@ HOT void kq_lanes_decode_impl(const uint8_t *in, size_t len, uint8_t *data, uint
         st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                               \
         RANS_REFILL(st_, p, end);                                                                \
         x[L] = st_; (OUT) = sy_; } while (0)
-    #define KQ_GETV(L, ROW, OUT) do {                                                            \
+    #define KQ_GETV(L, ROW, OUT, FAST) do {                                                            \
         size_t o_ = (size_t)(ROW) * k; const int16_t *T_ = U + o_;                               \
         uint32_t st_ = x[L], slot_ = st_ & (SM - 1);                                             \
         int sy_ = bits == 5 ? LUT_FIND(T_, Lt + o_, 7, 32, slot_) : kq_search(T_, k, slot_);     \
         uint32_t s0_ = sy_ ? (uint32_t)T_[sy_ - 1] : 0, f_ = (uint32_t)T_[sy_] - s0_;            \
         st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                               \
-        RANS_REFILL(st_, p, end);                                                                \
+        if (FAST) RANS_REFILL_NC(st_, p); else RANS_REFILL(st_, p, end);                         \
         x[L] = st_; (OUT) = sy_; } while (0)
     #define KQ_HDR(L, CTX, MASK, OUT) do { int s_; KQ_GET(L, UH + (size_t)(CTX) * k, 16, s_); (OUT) = s_ & (MASK); } while (0)
     #define KQ_F16(BASE, PA, PB, OUT) do { int a[KQ_LANES] = {0}, b_[KQ_LANES] = {0}, c_[KQ_LANES] = {0}, d_[KQ_LANES] = {0}; \
@@ -710,18 +735,21 @@ HOT void kq_lanes_decode_impl(const uint8_t *in, size_t len, uint8_t *data, uint
         for (int L = 0; L < nb; L++) { OUT[L] = (uint16_t)((a[L] << 12) | (b_[L] << 8) | (c_[L] << 4) | d_[L]); PA[L] = a[L]; PB[L] = b_[L]; } \
         } while (0)
     /* quick: one value row per zero point, so each gets a full slot -> symbol table */
+    /* a symbol byte per slot: 4 KiB per row (128 KiB for Q4_K). A packed 32-bit entry per slot
+       needs one load less but 4x the table, and was slower on a phone, whose caches it overflows */
     uint8_t *FS = NULL;
     if (quick) {
         FS = xmalloc((size_t)(zmax + 1) * SM);
         for (int z = 0; z <= zmax; z++) { const int16_t *T = U + (size_t)z * 36 * k; uint8_t *F = FS + (size_t)z * SM; int sy = 0;
             for (int sl = 0; sl < SM; sl++) { while (sy < k - 1 && T[sy] <= sl) sy++; F[sl] = (uint8_t)sy; } }
     }
-    #define KQ_GETF(L, Z, OUT) do {                                                              \
+    /* FAST: at least 2 bytes per symbol left, so the refill needs no bound check */
+    #define KQ_GETF(L, Z, OUT, FAST) do {                                                        \
         const int16_t *T_ = U + (size_t)(Z) * 36 * k; uint32_t st_ = x[L], slot_ = st_ & (SM - 1); \
         int sy_ = FS[(size_t)(Z) * SM + slot_];                                                  \
         uint32_t s0_ = sy_ ? (uint32_t)T_[sy_ - 1] : 0, f_ = (uint32_t)T_[sy_] - s0_;            \
         st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                               \
-        RANS_REFILL(st_, p, end);                                                                \
+        if (FAST) RANS_REFILL_NC(st_, p); else RANS_REFILL(st_, p, end);                                                           \
         x[L] = st_; (OUT) = sy_; } while (0)
     int da[KQ_LANES] = {0}, db[KQ_LANES] = {0}, ma[KQ_LANES] = {0}, mb[KQ_LANES] = {0}, psc[KQ_LANES] = {0}, pmn[KQ_LANES] = {0};
     for (uint64_t b0 = 0; b0 < nblocks; b0 += KQ_LANES) {
@@ -748,19 +776,24 @@ HOT void kq_lanes_decode_impl(const uint8_t *in, size_t len, uint8_t *data, uint
             if (quick) for (int h = 0; h < KQ_H; h++) {
                 int z[KQ_LANES];
                 for (int L = 0; L < KQ_LANES; L++) z[L] = zb[KQ_LANES * h + L];
-                for (int i = 0; i < 32; i++) for (int L = 0; L < KQ_LANES; L++) {
-                    int sy; KQ_GETF(L, z[L], sy); q[(KQ_LANES * h + L) * 32 + i] = (uint8_t)sy;
+                if (end - p >= 2 * 32 * KQ_LANES) {          /* the common case: no bound checks */
+                    for (int i = 0; i < 32; i++) for (int L = 0; L < KQ_LANES; L++) {
+                        int sy; KQ_GETF(L, z[L], sy, 1); q[(KQ_LANES * h + L) * 32 + i] = (uint8_t)sy;
+                    }
+                } else for (int i = 0; i < 32; i++) for (int L = 0; L < KQ_LANES; L++) {
+                    int sy; KQ_GETF(L, z[L], sy, 0); q[(KQ_LANES * h + L) * 32 + i] = (uint8_t)sy;
                 }
             }
             else for (int h = 0; h < KQ_H; h++) {
                 /* per lane: c = min(n0, 2) * 3 + min(nm, 2), stepped by a table; row = zb * 36 + c * 4 + i / 8 */
                 int c[KQ_LANES] = {0}, zr[KQ_LANES];
                 for (int L = 0; L < KQ_LANES; L++) zr[L] = zb[KQ_LANES * h + L] * 36;
-                for (int i = 0; i < 32; i++) for (int L = 0; L < KQ_LANES; L++) {
-                    int idx = (KQ_LANES * h + L) * 32 + i, sy;
-                    KQ_GETV(L, zr[L] + c[L] * 4 + (i >> 3), sy);
-                    q[idx] = (uint8_t)sy; c[L] = KQ_STEP[c[L]][sy == 0 ? 1 : sy == maxv ? 2 : 0];
-                }
+                #define KQ_VALS(FAST) for (int i = 0; i < 32; i++) for (int L = 0; L < KQ_LANES; L++) {   \
+                    int idx = (KQ_LANES * h + L) * 32 + i, sy;                                           \
+                    KQ_GETV(L, zr[L] + c[L] * 4 + (i >> 3), sy, FAST);                                   \
+                    q[idx] = (uint8_t)sy; c[L] = KQ_STEP[c[L]][sy == 0 ? 1 : sy == maxv ? 2 : 0]; }
+                if (end - p >= 2 * 32 * KQ_LANES) { KQ_VALS(1) } else { KQ_VALS(0) }
+                #undef KQ_VALS
             }
             k_pack_vals(B, bits, q);
         }
@@ -815,8 +848,12 @@ static inline int q40_ctx1(const uint32_t *P, uint64_t col, uint32_t inv, int ds
 }
 static inline void q40_unpack(const uint8_t *B, uint8_t *q) { for (int j = 0; j < 16; j++) { q[j] = B[2 + j] & 15; q[16 + j] = B[2 + j] >> 4; } }
 /* block b's value contexts, from the column counts P */
-static void q40_vctx(const uint32_t *P, uint64_t b, uint64_t bpr, const uint8_t *q, int ds, uint16_t *ctx) {
+static void q40_vctx(const uint32_t *P, uint64_t b, uint64_t bpr, const uint8_t *q, int ds, uint16_t *ctx, int quick) {
     uint64_t c0 = b % bpr * 32; int seen = 0, sa = 0; uint32_t inv = q40_inv(b / bpr);
+    if (quick) {                                   /* -q: the column's share and the position only */
+        for (int i = 0; i < 32; i++) ctx[i] = (uint16_t)(q40_cb(P[c0 + i], inv, ds) + (i >> 3));
+        return;
+    }
     for (int i = 0; i < 32; i++) {
         ctx[i] = (uint16_t)q40_ctx1(P, c0 + i, inv, ds, seen, sa, i);
         seen |= q[i] == 0; sa += q[i] < 8 ? 8 - q[i] : q[i] - 8;
@@ -827,7 +864,7 @@ static inline void q40_cols(uint32_t *P, uint64_t b, uint64_t bpr, const uint8_t
     uint32_t *Pc = P + b % bpr * 32;
     for (int i = 0; i < 32; i++) Pc[i] += (uint32_t)(dir * (((int)q[i] - 8) * ds > 0));
 }
-static void q40_count(uint32_t *cnt, const uint8_t *data, uint64_t rows, uint64_t ne0) {
+static void q40_count(uint32_t *cnt, const uint8_t *data, uint64_t rows, uint64_t ne0, int quick) {
     uint64_t bpr = ne0 / 32, nb = rows * bpr; uint32_t *P = calloc(ne0, 4); if (!P) die("out of memory");
     for (uint64_t b0 = 0; b0 < nb; b0 += 4) {
         int n = nb - b0 < 4 ? (int)(nb - b0) : 4; uint8_t q[4][32];
@@ -835,7 +872,7 @@ static void q40_count(uint32_t *cnt, const uint8_t *data, uint64_t rows, uint64_
             uint64_t b = b0 + L; const uint8_t *B = data + b * 18; uint16_t hc[4], ctx[32]; uint8_t hs[4];
             kq_f16_syms(rd16(B), b >= 4 ? rd16(B - 72) : 0, Q40_VCTX, hc, hs);
             for (int k = 0; k < 4; k++) cnt[((size_t)hc[k] << 4) + hs[k]]++;
-            q40_unpack(B, q[L]); q40_vctx(P, b, bpr, q[L], sgn16(rd16(B)), ctx);
+            q40_unpack(B, q[L]); q40_vctx(P, b, bpr, q[L], sgn16(rd16(B)), ctx, quick);
             for (int i = 0; i < 32; i++) cnt[((size_t)ctx[i] << 4) + q[L][i]]++;
         }
         for (int L = 0; L < n; L++) q40_cols(P, b0 + L, bpr, q[L], sgn16(rd16(data + (b0 + L) * 18)), 1);
@@ -844,7 +881,7 @@ static void q40_count(uint32_t *cnt, const uint8_t *data, uint64_t rows, uint64_
 }
 /* encode: everything in the reverse of the decoder's order, words written backwards. The column
    counts are run to the end first, then taken back group by group. 0 if it does not fit in cap. */
-static size_t q40_encode(const uint8_t *data, uint64_t rows, uint64_t ne0, const int16_t *U, uint8_t *out, size_t cap) {
+static size_t q40_encode(const uint8_t *data, uint64_t rows, uint64_t ne0, int quick, const int16_t *U, uint8_t *out, size_t cap) {
     size_t head = 16;
     if (cap < head + 2) return 0;
     uint64_t bpr = ne0 / 32, nb = rows * bpr; uint32_t *P = calloc(ne0, 4); if (!P) die("out of memory");
@@ -857,7 +894,7 @@ static size_t q40_encode(const uint8_t *data, uint64_t rows, uint64_t ne0, const
         for (int L = 0; L < n; L++) { const uint8_t *B = data + (b0 + L) * 18; q40_unpack(B, q[L]); ds[L] = sgn16(rd16(B)); q40_cols(P, b0 + L, bpr, q[L], ds[L], -1); }
         for (int L = 0; L < n; L++) {
             const uint8_t *B = data + (b0 + L) * 18;
-            q40_vctx(P, b0 + L, bpr, q[L], ds[L], ctx[L]);
+            q40_vctx(P, b0 + L, bpr, q[L], ds[L], ctx[L], quick);
             kq_f16_syms(rd16(B), b0 ? rd16(B - 72) : 0, Q40_VCTX, hc[L], hs[L]);
         }
         for (int i = 31; i >= 0; i--) for (int L = n - 1; L >= 0; L--)
@@ -877,9 +914,16 @@ typedef struct { uint32_t x[4]; const uint8_t *p, *end; } RansDec;
     st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                                       \
     RANS_REFILL(st_, (D)->p, (D)->end);                                                              \
     (D)->x[L] = st_; (OUT) = sy_; } while (0)
+/* the same from row ROW by its full slot table F (-q) */
+#define RD_GETT(D, L, ROW, F, OUT) do {                                                              \
+    const int16_t *T_ = (ROW); uint32_t st_ = (D)->x[L], slot_ = st_ & (SM - 1); int sy_ = (F)[slot_]; \
+    uint32_t s0_ = sy_ ? (uint32_t)T_[sy_ - 1] : 0, f_ = (uint32_t)T_[sy_] - s0_;                    \
+    st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                                       \
+    RANS_REFILL(st_, (D)->p, (D)->end);                                                              \
+    (D)->x[L] = st_; (OUT) = sy_; } while (0)
 /* one group of n blocks (n = 4 except at the end; inlined for each) */
 static inline __attribute__((always_inline)) void q40_dgroup(RansDec *D, uint8_t *data, uint64_t b0, const int n, uint64_t bpr,
-                                                             uint32_t *P, const int16_t *U, int *pa, int *pb) {
+                                                             uint32_t *P, const int16_t *U, int *pa, int *pb, const int quick, const uint8_t *FS) {
     const int16_t *UH = U + (size_t)Q40_VCTX * 16;
     int a[4] = {0}, bn[4] = {0}, cn[4] = {0}, dn[4] = {0}, ds[4], seen[4] = {0}, sa[4] = {0};
     uint64_t c0[4]; uint32_t inv[4]; uint8_t q[4][32]; uint16_t d[4];
@@ -891,7 +935,11 @@ static inline __attribute__((always_inline)) void q40_dgroup(RansDec *D, uint8_t
         d[L] = (uint16_t)((a[L] << 12) | (bn[L] << 8) | (cn[L] << 4) | dn[L]); pa[L] = a[L]; pb[L] = bn[L];
         ds[L] = sgn16(d[L]); inv[L] = q40_inv((b0 + L) / bpr); c0[L] = (b0 + L) % bpr * 32;
     }
-    for (int i = 0; i < 32; i++) for (int L = 0; L < n; L++) {
+    if (quick) for (int i = 0; i < 32; i++) for (int L = 0; L < n; L++) {   /* -q: a row per bucket and position */
+        int cb = q40_cb(P[c0[L] + i], inv[L], ds[L]), sy; RD_GETT(D, L, U + (size_t)(cb + (i >> 3)) * 16, FS + (size_t)((cb >> 6) * 4 + (i >> 3)) * SM, sy);
+        q[L][i] = (uint8_t)sy;
+    }
+    else for (int i = 0; i < 32; i++) for (int L = 0; L < n; L++) {
         int sy; RD_GET(D, L, U + (size_t)q40_ctx1(P, c0[L] + i, inv[L], ds[L], seen[L], sa[L], i) * 16, sy);
         q[L][i] = (uint8_t)sy; seen[L] |= sy == 0; sa[L] += sy < 8 ? 8 - sy : sy - 8;
     }
@@ -902,18 +950,33 @@ static inline __attribute__((always_inline)) void q40_dgroup(RansDec *D, uint8_t
     }
 }
 /* decode; corrupt input gives wrong values, never reads outside in[0..len) */
-HOT void q40_decode(const uint8_t *in, size_t len, uint8_t *data, uint64_t rows, uint64_t ne0, const int16_t *U) {
+/* -q: a full slot -> symbol table for each of n rows (row r at U + rowof(r) * 16) */
+static uint8_t *slot_tables(const int16_t *U, int n, int (*rowof)(int)) {
+    uint8_t *FS = xmalloc((size_t)n * SM);
+    for (int r = 0; r < n; r++) { const int16_t *T = U + (size_t)rowof(r) * 16; uint8_t *F = FS + (size_t)r * SM; int sy = 0;
+        for (int sl = 0; sl < SM; sl++) { while (sy < 15 && T[sy] <= sl) sy++; F[sl] = (uint8_t)sy; } }
+    return FS;
+}
+static int q40_qrow(int r) { return (r >> 2) * 64 + (r & 3); }
+HOT void q40_decode(const uint8_t *in, size_t len, uint8_t *data, uint64_t rows, uint64_t ne0, const int16_t *U, int quick) {
     if (len < 16) die("corrupt file");
     RansDec D; for (int L = 0; L < 4; L++) memcpy(&D.x[L], in + 4 * L, 4);
     D.p = in + 16; D.end = in + len;
     uint64_t bpr = ne0 / 32, nb = rows * bpr, b0 = 0; uint32_t *P = calloc(ne0, 4); if (!P) die("out of memory");
     int pa[4] = {0}, pb[4] = {0};
-    for (; b0 + 4 <= nb; b0 += 4) q40_dgroup(&D, data, b0, 4, bpr, P, U, pa, pb);
-    if (b0 < nb) q40_dgroup(&D, data, b0, (int)(nb - b0), bpr, P, U, pa, pb);
+    if (quick) {
+        uint8_t *FS = slot_tables(U, 32, q40_qrow);
+        for (; b0 + 4 <= nb; b0 += 4) q40_dgroup(&D, data, b0, 4, bpr, P, U, pa, pb, 1, FS);
+        if (b0 < nb) q40_dgroup(&D, data, b0, (int)(nb - b0), bpr, P, U, pa, pb, 1, FS);
+        free(FS);
+    } else {
+        for (; b0 + 4 <= nb; b0 += 4) q40_dgroup(&D, data, b0, 4, bpr, P, U, pa, pb, 0, NULL);
+        if (b0 < nb) q40_dgroup(&D, data, b0, (int)(nb - b0), bpr, P, U, pa, pb, 0, NULL);
+    }
     free(P);
 }
-static void q40_code(Coder *c, uint8_t *data, uint64_t rows, uint64_t ne0) {
-    if (!c->dec && c->cnt_only) q40_count(c->cnt, data, rows, ne0);
+static void q40_code(Coder *c, uint8_t *data, uint64_t rows, uint64_t ne0, int quick) {
+    if (!c->dec && c->cnt_only) q40_count(c->cnt, data, rows, ne0, quick);
     else die("internal: Q4_0 is coded with q40_encode / q40_decode");
 }
 
@@ -949,8 +1012,12 @@ static inline void q80_hdr_syms(uint16_t d, uint16_t pd, uint16_t *ctx, uint8_t 
     sym[2] = (uint8_t)c; ctx[2] = (uint16_t)(Q8_VROWS + Q8H_C + ((a << 4) | b));
     sym[3] = (uint8_t)e; ctx[3] = (uint16_t)(Q8_VROWS + Q8H_D + ((b << 4) | c));
 }
-static void q80_vctx(const uint32_t *P, uint64_t b, uint64_t bpr, const uint8_t *B, int ds, uint16_t *ctx) {
+static void q80_vctx(const uint32_t *P, uint64_t b, uint64_t bpr, const uint8_t *B, int ds, uint16_t *ctx, int quick) {
     uint64_t c0 = b % bpr * 32; uint32_t inv = q40_inv(b / bpr); int nx = 0, sa = 0;
+    if (quick) {                                   /* -q: the column's share only */
+        for (int i = 0; i < 32; i++) ctx[i] = (uint16_t)((q40_cb(P[c0 + i], inv, ds) >> 6) * 48);
+        return;
+    }
     for (int i = 0; i < 32; i++) {
         int v = (int)(int8_t)B[2 + i];
         ctx[i] = (uint16_t)q80_ctx1(P, c0 + i, inv, ds, nx, sa, i);
@@ -961,7 +1028,7 @@ static inline void q80_cols(uint32_t *P, uint64_t b, uint64_t bpr, const uint8_t
     uint32_t *Pc = P + b % bpr * 32;
     for (int i = 0; i < 32; i++) Pc[i] += (uint32_t)(dir * ((int)(int8_t)B[2 + i] * ds > 0));
 }
-static void q80_count(uint32_t *cnt, const uint8_t *data, uint64_t rows, uint64_t ne0) {
+static void q80_count(uint32_t *cnt, const uint8_t *data, uint64_t rows, uint64_t ne0, int quick) {
     uint64_t bpr = ne0 / 32, nb = rows * bpr; uint32_t *P = calloc(ne0, 4); if (!P) die("out of memory");
     for (uint64_t b0 = 0; b0 < nb; b0 += 4) {
         int n = nb - b0 < 4 ? (int)(nb - b0) : 4;
@@ -969,7 +1036,7 @@ static void q80_count(uint32_t *cnt, const uint8_t *data, uint64_t rows, uint64_
             uint64_t b = b0 + L; const uint8_t *B = data + b * 34; uint16_t hc[4], ctx[32]; uint8_t hs[4];
             q80_hdr_syms(rd16(B), b ? rd16(B - 34) : 0, hc, hs);
             for (int k = 0; k < 4; k++) cnt[((size_t)hc[k] << 4) + hs[k]]++;
-            q80_vctx(P, b, bpr, B, sgn16(rd16(B)), ctx);
+            q80_vctx(P, b, bpr, B, sgn16(rd16(B)), ctx, quick);
             for (int i = 0; i < 32; i++) {
                 int u = (int)(int8_t)B[2 + i] + 128;
                 cnt[((size_t)ctx[i] << 4) + (u >> 4)]++;
@@ -983,7 +1050,7 @@ static void q80_count(uint32_t *cnt, const uint8_t *data, uint64_t rows, uint64_
 /* encode: the reverse of the decoder's order (per group: each block's d, block by block, then the
    values), words written backwards; column counts run to the end first, then taken back group by
    group. 0 if it does not fit in cap. */
-static size_t q80_encode(const uint8_t *data, uint64_t rows, uint64_t ne0, const int16_t *U, uint8_t *out, size_t cap) {
+static size_t q80_encode(const uint8_t *data, uint64_t rows, uint64_t ne0, int quick, const int16_t *U, uint8_t *out, size_t cap) {
     size_t head = 16;
     if (cap < head + 2) return 0;
     uint64_t bpr = ne0 / 32, nb = rows * bpr; uint32_t *P = calloc(ne0, 4); if (!P) die("out of memory");
@@ -996,7 +1063,7 @@ static size_t q80_encode(const uint8_t *data, uint64_t rows, uint64_t ne0, const
         for (int L = 0; L < n; L++) { const uint8_t *B = data + (b0 + L) * 34; ds[L] = sgn16(rd16(B)); q80_cols(P, b0 + L, bpr, B, ds[L], -1); }
         for (int L = 0; L < n; L++) {
             const uint8_t *B = data + (b0 + L) * 34;
-            q80_vctx(P, b0 + L, bpr, B, ds[L], ctx[L]);
+            q80_vctx(P, b0 + L, bpr, B, ds[L], ctx[L], quick);
             q80_hdr_syms(rd16(B), b0 + L ? rd16(B - 34) : 0, hc[L], hs[L]);
         }
         for (int i = 31; i >= 0; i--) {                     /* decoder: all lanes' high, then all lanes' low */
@@ -1022,7 +1089,7 @@ full:
     free(w); free(P); return 0;
 }
 static inline __attribute__((always_inline)) void q80_dgroup(RansDec *D, uint8_t *data, uint64_t b0, const int n, uint64_t bpr,
-                                                             uint32_t *P, const int16_t *U, uint16_t *pd) {
+                                                             uint32_t *P, const int16_t *U, uint16_t *pd, const int quick, const uint8_t *FS) {
     const int16_t *UH = U + (size_t)Q8_VROWS * 16;
     int ds[4] = {0}, nx[4] = {0}, sa[4] = {0};
     uint64_t c0[4] = {0}; uint32_t inv[4] = {0}; int8_t q[4][32];
@@ -1038,7 +1105,11 @@ static inline __attribute__((always_inline)) void q80_dgroup(RansDec *D, uint8_t
     }
     for (int i = 0; i < 32; i++) {
         int ctx[4], hi[4];
-        for (int L = 0; L < n; L++) { ctx[L] = q80_ctx1(P, c0[L] + i, inv[L], ds[L], nx[L], sa[L], i); RD_GET(D, L, U + (size_t)ctx[L] * 16, hi[L]); }
+        if (quick) for (int L = 0; L < n; L++) {           /* -q: the high nibble by its bucket's full table */
+            int cb = q40_cb(P[c0[L] + i], inv[L], ds[L]) >> 6; ctx[L] = cb * 48;
+            RD_GETT(D, L, U + (size_t)ctx[L] * 16, FS + (size_t)cb * SM, hi[L]);
+        }
+        else for (int L = 0; L < n; L++) { ctx[L] = q80_ctx1(P, c0[L] + i, inv[L], ds[L], nx[L], sa[L], i); RD_GET(D, L, U + (size_t)ctx[L] * 16, hi[L]); }
         for (int L = 0; L < n; L++) {
             int lo; RD_GET(D, L, U + (size_t)(Q8_CTX + ctx[L] * 16 + hi[L]) * 16, lo);
             int v = ((hi[L] << 4) | lo) - 128; q[L][i] = (int8_t)v;
@@ -1051,18 +1122,26 @@ static inline __attribute__((always_inline)) void q80_dgroup(RansDec *D, uint8_t
     }
 }
 /* decode; corrupt input gives wrong values, never reads outside in[0..len) */
-HOT void q80_decode(const uint8_t *in, size_t len, uint8_t *data, uint64_t rows, uint64_t ne0, const int16_t *U) {
+static int q80_qrow(int r) { return r * 48; }
+HOT void q80_decode(const uint8_t *in, size_t len, uint8_t *data, uint64_t rows, uint64_t ne0, const int16_t *U, int quick) {
     if (len < 16) die("corrupt file");
     RansDec D; for (int L = 0; L < 4; L++) memcpy(&D.x[L], in + 4 * L, 4);
     D.p = in + 16; D.end = in + len;
     uint64_t bpr = ne0 / 32, nb = rows * bpr, b0 = 0; uint32_t *P = calloc(ne0, 4); if (!P) die("out of memory");
     uint16_t pd = 0;
-    for (; b0 + 4 <= nb; b0 += 4) q80_dgroup(&D, data, b0, 4, bpr, P, U, &pd);
-    if (b0 < nb) q80_dgroup(&D, data, b0, (int)(nb - b0), bpr, P, U, &pd);
+    if (quick) {
+        uint8_t *FS = slot_tables(U, 8, q80_qrow);
+        for (; b0 + 4 <= nb; b0 += 4) q80_dgroup(&D, data, b0, 4, bpr, P, U, &pd, 1, FS);
+        if (b0 < nb) q80_dgroup(&D, data, b0, (int)(nb - b0), bpr, P, U, &pd, 1, FS);
+        free(FS);
+    } else {
+        for (; b0 + 4 <= nb; b0 += 4) q80_dgroup(&D, data, b0, 4, bpr, P, U, &pd, 0, NULL);
+        if (b0 < nb) q80_dgroup(&D, data, b0, (int)(nb - b0), bpr, P, U, &pd, 0, NULL);
+    }
     free(P);
 }
-static void q80_code(Coder *c, uint8_t *data, uint64_t rows, uint64_t ne0) {
-    if (!c->dec && c->cnt_only) q80_count(c->cnt, data, rows, ne0);
+static void q80_code(Coder *c, uint8_t *data, uint64_t rows, uint64_t ne0, int quick) {
+    if (!c->dec && c->cnt_only) q80_count(c->cnt, data, rows, ne0, quick);
     else die("internal: Q8_0 is coded with q80_encode / q80_decode");
 }
 
@@ -1576,8 +1655,8 @@ static void code_seg(Coder *c, Seg *s, uint8_t *p) {
             if (!c->dec && c->cnt_only) q6_count(c->cnt, p, s->rows, s->ne0);
             else die("internal: Q6_K is coded with q6_encode / q6_decode");
             break;
-        case T_Q8_0: q80_code(c, p, s->rows, s->ne0); break;
-        case T_Q4_0: q40_code(c, p, s->rows, s->ne0); break;
+        case T_Q8_0: q80_code(c, p, s->rows, s->ne0, (s->model & 255) == M_QUICK); break;
+        case T_Q4_0: q40_code(c, p, s->rows, s->ne0, (s->model & 255) == M_QUICK); break;
         case T_BYTES: bytes_code(c, p, s->size); break;
         case T_STRS: strs_code(c, p, s->size); break;
         case T_M32: float_code(c, p, s->rows * s->ne0, T_F32); break;
@@ -1596,10 +1675,12 @@ static int kq_index(uint32_t type) {
 static const int KQ_SYM[NSTATIC] = {16, 32, 64, 16, 16, 16, 16, 16, 64},
                  KQ_CTX[NSTATIC] = {32 * 36 + KH_CTX, 64 * 36 + KH_CTX, Q6_CTX + Q6H_CTX, Q8_CTX * 17 + Q8H_CTX, FL_HI, FL_HI, FL_HI + FL_LO, Q40_VCTX + FL_HI, Q6L_N + Q6H_CTX};
 /* segments coded with static tables: tensor types, not raw */
+/* types with a quick model (-q) */
+static int has_quick(uint32_t type) { return type == T_Q4K || type == T_Q5K || type == T_Q4_0 || type == T_Q8_0 || type == T_BF16 || type == T_F16 || type == T_F32; }
 static int is_static(const Seg *s) {
     int md = s->model & 255;
     return kq_index(s->type) >= 0 && (md == M_NORMAL || (md == M_LATTICE && s->type == T_Q6K) ||
-                                      (md == M_QUICK && (s->type == T_Q4K || s->type == T_Q5K)));
+                                      (md == M_QUICK && has_quick(s->type)));
 }
 /* the segment's table set: by type, and Q6_K lattice segments their own */
 static int tab_index(const Seg *s) { return s->type == T_Q6K && (s->model & 255) == M_LATTICE ? 8 : kq_index(s->type); }
@@ -2270,13 +2351,13 @@ static void static_rans_decode(Job *j, Seg *s, const uint8_t *in, size_t len, ui
     if (is_kq45(s->type)) {
         int bits = s->type == T_Q4K ? 4 : 5;
         kq_lanes_decode(body, blen, out, s->size / (bits == 4 ? 144 : 176), bits, (s->model & 255) == M_QUICK, U, Lt);
-    } else if (s->type == T_Q4_0) q40_decode(body, blen, out, s->rows, s->ne0, U);
-    else if (s->type == T_Q8_0) q80_decode(body, blen, out, s->rows, s->ne0, U);
+    } else if (s->type == T_Q4_0) q40_decode(body, blen, out, s->rows, s->ne0, U, (s->model & 255) == M_QUICK);
+    else if (s->type == T_Q8_0) q80_decode(body, blen, out, s->rows, s->ne0, U, (s->model & 255) == M_QUICK);
     else if (s->type == T_Q6K) {
         if (t == 8) q6l_decode(body, blen, out, s->rows, s->ne0, U, Lt);
         else q6_decode(body, blen, out, s->rows, s->ne0, U, Lt);
     }
-    else float_decode(body, blen, s->rows * s->ne0, fl_type(s->type), U, out);
+    else float_decode(body, blen, s->rows * s->ne0, fl_type(s->type), (s->model & 255) == M_QUICK, U, out);
     free(Lt); free(U);
 }
 /* a coded segment: store raw if not smaller, then write it (compress) or check it (test) */
@@ -2323,10 +2404,10 @@ static void *worker(void *arg) {
                         uint32_t tl = (uint32_t)c.pos; memcpy(o, &tl, 4); memcpy(o + 4, c.buf, tl);
                         size_t r = is_kq45(s->type)
                             ? kq_lanes_encode(src, s->size / (s->type == T_Q4K ? 144 : 176), s->type == T_Q4K ? 4 : 5, (s->model & 255) == M_QUICK, U, o + 4 + tl, s->size - 4 - tl)
-                            : s->type == T_Q4_0 ? q40_encode(src, s->rows, s->ne0, U, o + 4 + tl, s->size - 4 - tl)
-                            : s->type == T_Q8_0 ? q80_encode(src, s->rows, s->ne0, U, o + 4 + tl, s->size - 4 - tl)
+                            : s->type == T_Q4_0 ? q40_encode(src, s->rows, s->ne0, (s->model & 255) == M_QUICK, U, o + 4 + tl, s->size - 4 - tl)
+                            : s->type == T_Q8_0 ? q80_encode(src, s->rows, s->ne0, (s->model & 255) == M_QUICK, U, o + 4 + tl, s->size - 4 - tl)
                             : s->type == T_Q6K ? (t == 8 ? q6l_encode : q6_encode)(src, s->rows, s->ne0, U, o + 4 + tl, s->size - 4 - tl)
-                            : float_encode(src, s->rows * s->ne0, fl_type(s->type), U, o + 4 + tl, s->size - 4 - tl);
+                            : float_encode(src, s->rows * s->ne0, fl_type(s->type), (s->model & 255) == M_QUICK, U, o + 4 + tl, s->size - 4 - tl);
                         if (r) total = 4 + tl + r;
                     }
                     free(c.buf); c.buf = o; c.pos = total; c.cap = s->size + 16;
@@ -2338,8 +2419,19 @@ static void *worker(void *arg) {
             } else if (t >= 0) {                             /* pass 1: count (Q6_K may pick the lattice now) */
                 size_t tn = (size_t)KQ_CTX[t] * KQ_SYM[t];
                 uint32_t *cnt = calloc(tn, 4); if (!cnt) die("out of memory");
-                s->model = j->quick && (s->type == T_Q4K || s->type == T_Q5K) ? M_QUICK : M_NORMAL;
+                int fl = s->type == T_BF16 || s->type == T_F16 || s->type == T_F32;
+                s->model = j->quick && has_quick(s->type) && !fl ? M_QUICK : M_NORMAL;
                 { Coder cc; memset(&cc, 0, sizeof cc); cc.cnt = cnt; cc.cnt_only = 1; code_seg(&cc, s, (uint8_t *)src); }
+                if (j->quick && fl) {                        /* -q floats: only if uniform low nibbles cost under 1% */
+                    double all = count_bits(cnt, KQ_CTX[t], 16), uni = 0, mod = 0;
+                    int r0[3] = {272, 528, FL_HI}, r1[3] = {528, 544, FL_HI + FL_LO}, kk[3] = {2, 3, 4};
+                    for (int g = 0; g < 3; g++) {
+                        if (!fl_uni(s->type, kk[g]) || (g == 2 && s->type != T_F32)) continue;
+                        uint64_t nn = 0; for (size_t q = (size_t)r0[g] * 16; q < (size_t)r1[g] * 16; q++) nn += cnt[q];
+                        uni += 4.0 * nn; mod += count_bits(cnt + (size_t)r0[g] * 16, r1[g] - r0[g], 16);
+                    }
+                    if (uni - mod <= 0.01 * all) s->model = M_QUICK;
+                }
                 if (s->type == T_Q6K && lattice_sample(src, s->size / 210) < 20) {
                     /* the lattice too: the model whose counts have the lower entropy (both static) */
                     size_t tn2 = (size_t)KQ_CTX[8] * KQ_SYM[8];
@@ -2407,7 +2499,7 @@ static void *worker(void *arg) {
    arrays estimated 14x: about half their bytes go to the byte model, the lengths cost little */
 static int SORT_PASS1, SORT_QUICK;                          /* compress pass 1: whether Q6_K tries the lattice is not known yet */
 static double seg_cost(const Seg *s) {
-    if ((s->model & 255) == M_QUICK || (SORT_QUICK && (s->type == T_Q4K || s->type == T_Q5K))) return (double)s->size * 0.65;
+    if ((s->model & 255) == M_QUICK || (SORT_QUICK && has_quick(s->type))) return (double)s->size * (s->type == T_Q8_0 ? 1.2 : 0.65);
     double w = s->type == T_BYTES ? 25 : s->type == T_STRS ? 14 : s->type == T_Q8_0 ? 1.8 : s->type == T_Q4_0 ? 1.6 : s->type == T_Q5K ? 0.85 :
                s->type != T_Q6K ? 1 : SORT_PASS1 ? 2 : (s->model & 255) == M_LATTICE ? 3 : 1.1;
     return (double)s->size * w;
@@ -2464,12 +2556,12 @@ static const uint8_t *map_file(const char *path, size_t *n) {
 }
 static void report(Seg *s, int n, uint64_t *clen, uint64_t total, uint64_t out_total) {
     uint64_t ob[NTYPES] = {0}, cb[NTYPES] = {0}, vals[NTYPES] = {0};
-    int nraw = 0, nlat = 0, n6 = 0, nkq = 0, nqk = 0, rawn[NTYPES] = {0}; uint64_t rawb[NTYPES] = {0}, rawmax[NTYPES] = {0};
+    int nraw = 0, nlat = 0, n6 = 0, nkq = 0, nqk = 0, qn[NTYPES] = {0}, qq[NTYPES] = {0}, rawn[NTYPES] = {0}; uint64_t rawb[NTYPES] = {0}, rawmax[NTYPES] = {0};
     for (int i = 0; i < n; i++) {
         int k = type_index(s[i].type); ob[k] += s[i].size; cb[k] += clen[i]; vals[k] += s[i].rows * s[i].ne0;
         if (s[i].model == M_RAW) { nraw++; rawn[k]++; rawb[k] += s[i].size; if (s[i].size > rawmax[k]) rawmax[k] = s[i].size; }
         if (s[i].type == T_Q6K) { n6++; nlat += (s[i].model & 255) == M_LATTICE; }
-        if (s[i].type == T_Q4K || s[i].type == T_Q5K) { nkq++; nqk += (s[i].model & 255) == M_QUICK; }
+        if (has_quick(s[i].type) && s[i].model != M_RAW) { nkq++; nqk += (s[i].model & 255) == M_QUICK; qn[k]++; qq[k] += (s[i].model & 255) == M_QUICK; }
     }
     for (int k = 0; k < NTYPES; k++) if (ob[k]) {
         uint32_t id = TYPES[k].id;
@@ -2480,7 +2572,11 @@ static void report(Seg *s, int n, uint64_t *clen, uint64_t total, uint64_t out_t
     }
 
     if (n6) printf("  Q6_K segments using the AWQ lattice: %d of %d\n", nlat, n6);
-    if (nqk) printf("  Q4_K/Q5_K segments in the quick model (-q): %d of %d\n", nqk, nkq);
+    if (nqk || (nkq && SORT_QUICK)) {                 /* per type: floats stay normal where the shortcut costs over 1% */
+        printf("  segments in the quick model (-q):");
+        for (int k = 0; k < NTYPES; k++) if (qn[k]) printf(" %s %d of %d", TYPES[k].name, qq[k], qn[k]);
+        printf("\n");
+    }
     if (nraw) {
         printf("  segments stored raw (coding would not shrink them): %d\n", nraw);
         for (int k = 0; k < NTYPES; k++) if (rawn[k])
@@ -2503,7 +2599,7 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
         printf("note: %.*f MiB of %s tensors, a type tenz has no model for: stored as they are\n", MiB(g_unmodelled[t]) < 0.1 ? 3 : 1, MiB(g_unmodelled[t]), ggml_name(t));
     Job j; memset(&j, 0, sizeof j);
     j.mode = test ? 2 : 0; j.seg = s; j.n = ns; j.in = p; j.fd = -1; j.phase = 1; j.quick = quick;
-    if (quick) printf("quick (-q): Q4_K and Q5_K in the faster model, at a small cost in size\n");
+    if (quick) printf("quick (-q): Q4_K, Q5_K, Q4_0, Q8_0 and floats in faster models, at a small cost in size\n");
     if (hsym) printf("-H: no longer needed, every block header is coded as symbols (ignored)\n");
     threads = plan_memory(&j, threads, limit);
     j.clen = calloc(ns + 1, 8); j.coff = calloc(ns + 1, 8);
@@ -2606,7 +2702,7 @@ static void cmd_decompress(const char *in, const char *out, int threads, uint64_
         if (type_index(s[i].type) < 0 || !s[i].ne0) die("corrupt header");
         {   uint32_t md = s[i].model & 255;
             if (md != M_NORMAL && md != M_RAW && !(md == M_LATTICE && s[i].type == T_Q6K) &&
-                !(md == M_QUICK && (s[i].type == T_Q4K || s[i].type == T_Q5K))) die("corrupt header");
+                !(md == M_QUICK && has_quick(s[i].type))) die("corrupt header");
             if (s[i].model >> 8) die("corrupt header"); }
         s[i].size = seg_bytes(&s[i]); pos += ENTRY;
         if (coff[i] > n || clen[i] > n - coff[i] || s[i].off > orig || s[i].size > orig - s[i].off) die("corrupt header");
@@ -2675,8 +2771,8 @@ int main(int argc, char **argv) {
             "       tenz v   (version)\n"
             "  out defaults to in + .tenz (c) or in without"
             " .tenz (d); -f overwrites an existing file\n"
-            "  -q: quick, Q4_K and Q5_K in a faster model"
-            " (about 35%% faster for them, a little larger)\n"
+            "  -q: quick, Q4_K, Q5_K, Q4_0, Q8_0 and floats"
+            " in faster models (a little larger)\n"
             "  defaults: all cores, segments of 1/24 of the"
             " file (8 to 48 MiB); memory: what is free,\n"
             "  minus a reserve for the device (15%% of RAM,"

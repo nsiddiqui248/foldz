@@ -7,7 +7,7 @@ Each section becomes the release notes when its tag (for example `v0.23`) is pus
 ## [Unreleased]
 
 ## [0.23] - 2026-11-14
-- New option `-q` (quick): Q4_K and Q5_K values given only the zero point, about 35% faster for them, 0.6–0.8 points less saved (Qwen3.5-2B: 8.18% instead of 8.54%). Recorded per segment, so `tenz d` needs no option.
+- New option `-q` (quick): faster models for Q4_K, Q5_K, Q4_0, Q8_0 and floats, a fraction of a point less saved (Qwen3.5-2B Q4_K_M 8.54% → 8.18%, Llama-3.2-1B Q8_0 8.27% → 7.82%, BF16 34.25% → 34.19%, Gemma-4-31B Q4_0 12.70% → 12.19%). Recorded per segment.
 - Branch-free rANS refill in every decoder: Q4_K/Q5_K decoding about 20% faster, Q8_0 about 14%, output unchanged.
 
 ## [0.22] - 2026-11-14
